@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common'
+import bcrypt from 'bcryptjs'
 import mongoose from 'mongoose'
 import { buildChunkSeeds, embedText } from '../documents/embedding.util'
 import {
@@ -12,6 +13,7 @@ import {
   DocumentChunkModel,
   DocumentModel,
   MessageModel,
+  RevokedTokenModel,
   UserModel,
 } from './models'
 
@@ -21,9 +23,12 @@ export type {
   DocumentEntity,
   DocumentStatus,
   MessageEntity,
+  RevokedTokenEntity,
   SourceRef,
   UserEntity,
 } from './models'
+
+const BCRYPT_ROUNDS = 10
 
 // ---------------------------------------------------------------------------
 // Demo seed data (only inserted when the collections are empty)
@@ -176,6 +181,7 @@ export class DatabaseService implements OnApplicationBootstrap {
   readonly chunks = DocumentChunkModel
   readonly conversations = ConversationModel
   readonly messages = MessageModel
+  readonly revokedTokens = RevokedTokenModel
 
   /** Called automatically once the app has finished bootstrapping. */
   async onApplicationBootstrap(): Promise<void> {
@@ -195,7 +201,14 @@ export class DatabaseService implements OnApplicationBootstrap {
 
     // users ----------------------------------------------------------------
     if ((await this.users.countDocuments()) === 0) {
-      await this.users.insertMany(SEED_USERS)
+      // store a bcrypt hash, never the plaintext password
+      const users = await Promise.all(
+        SEED_USERS.map(async (user) => ({
+          ...user,
+          password: await bcrypt.hash(user.password, BCRYPT_ROUNDS),
+        })),
+      )
+      await this.users.insertMany(users)
       this.logger.log('Seeded demo user (demo@nexa.ai)')
     }
 

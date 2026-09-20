@@ -12,6 +12,13 @@ async function bootstrap() {
     process.exit(1)
   }
 
+  if (!process.env.JWT_SECRET) {
+    console.error(
+      'JWT_SECRET is missing. Generate one with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"',
+    )
+    process.exit(1)
+  }
+
   // Connect to MongoDB BEFORE the app boots, so no request can ever
   // race the database connection.
   await mongoose.connect(mongoUri, {

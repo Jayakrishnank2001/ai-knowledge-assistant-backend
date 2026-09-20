@@ -4,11 +4,17 @@ import {
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common'
-import { randomUUID } from 'crypto'
+import { JwtService } from '@nestjs/jwt'
+import bcrypt from 'bcryptjs'
 import { DatabaseService } from '../database/database.service'
 import { LoginDto, RegisterDto, UpdateProfileDto } from './dto/auth.dto'
 
-/** Minimal slice of a hydrated mongoose document the session logic needs. */
+const BCRYPT_ROUNDS = 10
+/** bcrypt hashes always start with $2a/$2b/$2y - anything else is a legacy plaintext row. */
+const BCRYPT_PREFIX = '$2'
+const DEFAULT_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+/** Minimal slice of a hydrated mongoose document the auth logic needs. */
 interface StoredUser {
   _id: { toString(): string }
   email: string
@@ -17,16 +23,24 @@ interface StoredUser {
   workspaceName?: string
 }
 
+interface JwtPayload {
+  sub: string
+  email: string
+  exp?: number
+}
+
 @Injectable()
 export class AuthService {
-  /** token -> userId. Swapped for JWT / Redis sessions in a real app. */
-  private readonly sessions = new Map<string, string>()
-
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly jwt: JwtService,
+  ) {}
 
   async login(dto: LoginDto) {
-    const user = (await this.db.users.findOne({ email: dto.email.toLowerCase() })) as StoredUser | null
-    if (!user || user.password !== dto.password) {
+    const user = (await this.db.users.findOne({
+      email: dto.email.toLowerCase(),
+    })) as StoredUser | null
+    if (!user || !(await this.passwordMatches(dto.password, user))) {
       throw new UnauthorizedException('Invalid email or password')
     }
     return this.createSession(user)
@@ -40,8 +54,9 @@ export class AuthService {
     try {
       const user = (await this.db.users.create({
         email,
-        password: dto.password,
+        password: await bcrypt.hash(dto.password, BCRYPT_ROUNDS),
         name: dto.name,
+        workspaceName: 'Acme knowledge base',
       })) as StoredUser
       return this.createSession(user)
     } catch (error) {
@@ -53,14 +68,44 @@ export class AuthService {
     }
   }
 
-  /** Verify a bearer token and return the logged-in user (throws if invalid). */
+  /**
+   * Verify a signed token and return the logged-in user.
+   * Tokens are stateless, so this is where the signature, expiry and the
+   * logout revocation list are all enforced.
+   */
   async me(token: string) {
-    const user = await this.findByToken(token)
+    const payload = this.verifyToken(token)
+
+    if (await this.db.revokedTokens.exists({ token })) {
+      throw new UnauthorizedException('Session has been logged out')
+    }
+
+    const user = (await this.db.users.findById(payload.sub)) as StoredUser | null
+    if (!user) {
+      throw new UnauthorizedException('Invalid or expired session')
+    }
     return this.publicUser(user)
   }
 
+  /**
+   * Revoke a token so it stops working immediately. The row lives in MongoDB
+   * and carries a TTL index, so it is deleted automatically once the JWT
+   * itself would have expired.
+   */
   async logout(token: string) {
-    this.sessions.delete(token)
+    try {
+      const payload = this.jwt.verify<JwtPayload>(token)
+      const expiresAt = payload.exp
+        ? new Date(payload.exp * 1000)
+        : new Date(Date.now() + DEFAULT_TOKEN_TTL_MS)
+      await this.db.revokedTokens.updateOne(
+        { token },
+        { $set: { token, expiresAt } },
+        { upsert: true },
+      )
+    } catch {
+      // already invalid or expired - there is nothing left to revoke
+    }
     return { success: true }
   }
 
@@ -103,21 +148,32 @@ export class AuthService {
     }
   }
 
-  private async findByToken(token: string): Promise<StoredUser> {
-    const userId = this.sessions.get(token)
-    if (!userId) {
+  /**
+   * Accepts bcrypt hashes and - for rows created before hashing was added -
+   * plaintext passwords, which are upgraded to a hash on first login.
+   */
+  private async passwordMatches(plain: string, user: StoredUser): Promise<boolean> {
+    if (user.password.startsWith(BCRYPT_PREFIX)) {
+      return bcrypt.compare(plain, user.password)
+    }
+    if (user.password !== plain) return false
+    await this.db.users.updateOne(
+      { _id: user._id },
+      { $set: { password: await bcrypt.hash(plain, BCRYPT_ROUNDS) } },
+    )
+    return true
+  }
+
+  private verifyToken(token: string): JwtPayload {
+    try {
+      return this.jwt.verify<JwtPayload>(token)
+    } catch {
       throw new UnauthorizedException('Invalid or expired session')
     }
-    const user = (await this.db.users.findById(userId)) as StoredUser | null
-    if (!user) {
-      throw new UnauthorizedException('Invalid or expired session')
-    }
-    return user
   }
 
   private createSession(user: StoredUser) {
-    const token = `token_${randomUUID()}`
-    this.sessions.set(token, user._id.toString())
+    const token = this.jwt.sign({ sub: user._id.toString(), email: user.email })
     return { token, user: this.publicUser(user) }
   }
 

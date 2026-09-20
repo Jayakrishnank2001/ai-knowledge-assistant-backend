@@ -56,6 +56,12 @@ export interface UserEntity {
   workspaceName?: string
 }
 
+/** A logout-invalidated JWT. A TTL index prunes rows once the token expires. */
+export interface RevokedTokenEntity {
+  token: string
+  expiresAt: Date
+}
+
 // ---------------------------------------------------------------------------
 // Schemas — the MongoDB-level rules for each collection
 // ---------------------------------------------------------------------------
@@ -141,6 +147,16 @@ const userSchema = new Schema(
   { collection: 'users' },
 )
 
+const revokedTokenSchema = new Schema(
+  {
+    token: { type: String, required: true, unique: true },
+    expiresAt: { type: Date, required: true },
+  },
+  { collection: 'revoked_tokens' },
+)
+// MongoDB deletes the row automatically once the JWT itself has expired
+revokedTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+
 // ---------------------------------------------------------------------------
 // Models — the typed handles used to query each collection
 // ---------------------------------------------------------------------------
@@ -156,3 +172,8 @@ export const ConversationModel: Model<ConversationEntity> = mongoose.model<Conve
   conversationSchema,
 )
 export const MessageModel: Model<MessageEntity> = mongoose.model<MessageEntity>('Message', messageSchema)
+
+export const RevokedTokenModel: Model<RevokedTokenEntity> = mongoose.model<RevokedTokenEntity>(
+  'RevokedToken',
+  revokedTokenSchema,
+)

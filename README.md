@@ -104,13 +104,14 @@ src/
 ├── app.module.ts               # root module wiring all feature modules
 ├── database/                   # @Global Mongoose-backed data layer + seeding
 │   ├── models.ts               # schemas + typed models (users, documents,
-│   │                           #   document_chunks, conversations, messages)
+│   │                           #   document_chunks, conversations, messages,
+│   │                           #   revoked_tokens)
 │   └── database.service.ts     # repository facade (db.users / .documents / ...)
 ├── documents/                  # list / get / upload / delete
 │   ├── gridfs.service.ts       # GridFS upload/delete wrapper
 │   ├── chunks.service.ts       # chunk generation + cascading cleanup
 │   ├── embedding.util.ts       # mock embedText/cosine similarity/chunk builder
-├── auth/                       # login, register, /me, logout + AuthGuard
+├── auth/                       # JWT login/register/me/logout + AuthGuard + bcrypt
 ├── conversations/              # conversations + messages split into their own models
 ├── chat/                       # RAG retrieval over document_chunks (KnowledgeBaseService)
 └── overview/                   # dashboard stats + recent documents
@@ -131,12 +132,20 @@ Base URL: `http://localhost:3001/api`
 
 ### Auth (demo account: `demo@nexa.ai` / `password123`)
 
-| Method | Route                | Body                              | Description              |
-| ------ | -------------------- | --------------------------------- | ------------------------ |
-| POST   | `/auth/login`        | `{ email, password }`             | Returns `{ token, user }`|
-| POST   | `/auth/register`     | `{ name, email, password }`       | Creates an account       |
-| GET    | `/auth/me`           | _Bearer token_                    | Current logged-in user   |
-| POST   | `/auth/logout`       | _Bearer token_                    | Invalidates the session  |
+| Method | Route                | Body                                | Description                       |
+| ------ | -------------------- | ----------------------------------- | --------------------------------- |
+| POST   | `/auth/login`        | `{ email, password }`               | Returns `{ token, user }` (JWT)   |
+| POST   | `/auth/register`     | `{ name, email, password }`         | Creates an account, returns JWT   |
+| GET    | `/auth/me`           | _Bearer token_                      | Current logged-in user            |
+| PATCH  | `/auth/me`           | `{ name?, email?, workspaceName? }` | Update profile (guarded)          |
+| POST   | `/auth/logout`       | _Bearer token_                      | Revokes the token                 |
+
+**Sessions:** signed **JWTs** (7-day expiry, `JWT_SECRET` in `.env`). Passwords are
+hashed with **bcrypt** on register/seed; legacy plaintext rows are upgraded to a
+hash on first login. Because tokens are stateless, they **survive server
+restarts**. Logout writes the token to a `revoked_tokens` collection with a TTL
+index, so it stops working immediately and the row self-deletes once the JWT
+expires.
 
 ### Documents
 
