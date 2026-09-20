@@ -5,6 +5,8 @@ import {
   NotFoundException,
 } from '@nestjs/common'
 import { DatabaseService, DocumentStatus } from '../database/database.service'
+import { ChunksService } from './chunks.service'
+import { GridFsService } from './gridfs.service'
 
 const MB = 1024 * 1024
 
@@ -18,14 +20,16 @@ export interface DocumentDto {
   pageCount: number
 }
 
-/** Shape of a row returned by MongoDB (entity + the generated _id). */
+/** Shape of a row returned by MongoDB (entity + the generated ids). */
 interface StoredDocument {
   _id: { toString(): string }
   fileName: string
+  mimeType?: string
   fileSizeBytes: number
   status: DocumentStatus
   uploadedAt: Date
   pageCount: number
+  gridFsFileId?: { toString(): string } | null
 }
 
 function formatBytes(bytes: number): string {
@@ -49,7 +53,11 @@ function toDto(doc: StoredDocument): DocumentDto {
 export class DocumentsService {
   private readonly logger = new Logger(DocumentsService.name)
 
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly gridFs: GridFsService,
+    private readonly chunks: ChunksService,
+  ) {}
 
   async list(): Promise<DocumentDto[]> {
     const docs = await this.db.documents.find().sort({ uploadedAt: -1 }).exec()
@@ -65,48 +73,84 @@ export class DocumentsService {
   }
 
   /**
-   * Persists an uploaded PDF, initially marked as "processing", then flips it
-   * to "completed" after a few seconds (in a real app this would be a text
-   * extraction / embedding step, often a background job).
+   * Upload pipeline:
+   *   1. store the PDF binary in GridFS (fs.files / fs.chunks are created
+   *      automatically; GridFS never shows up as an application collection)
+   *   2. insert the `documents` metadata row with a reference to the GridFS id
+   *   3. after a short "processing" delay, extract chunks + embeddings into
+   *      `document_chunks` and mark the document completed
    */
   async create(file: Express.Multer.File): Promise<DocumentDto> {
+    if (!file.buffer || file.buffer.length === 0) {
+      throw new BadRequestException('The uploaded file is empty')
+    }
+
+    const gridFsFileId = await this.gridFs.upload(file.originalname, file.buffer, {
+      mimeType: file.mimetype,
+    })
+
     const doc = await this.db.documents.create({
+      userId: null, // no auth-scoped uploads yet; wired up for the future
       fileName: file.originalname,
+      mimeType: file.mimetype,
       fileSizeBytes: file.size,
       status: 'processing' as DocumentStatus,
       uploadedAt: new Date(),
       pageCount: 0,
+      gridFsFileId,
     })
 
     setTimeout(() => {
-      void this.db.documents
-        .updateOne(
-          { _id: doc._id },
-          {
-            $set: {
-              status: 'completed',
-              pageCount: 8 + Math.round(Math.random() * 60),
-            },
-          },
-        )
-        .then((result) =>
-          this.logger.log(
-            `Document "${doc.fileName}" processed (matched=${result.matchedCount}, modified=${result.modifiedCount})`,
-          ),
-        )
-        .catch((error: Error) =>
-          this.logger.error(`Failed to finalize document "${doc.fileName}": ${error.message}`, undefined, 'DocumentsService'),
-        )
+      void this.processDocument(doc)
     }, 2500)
 
     return toDto(doc)
   }
 
+  /** Extract chunks + embeddings, then flip the document to completed. */
+  private async processDocument(doc: StoredDocument): Promise<void> {
+    try {
+      const { chunkCount, pageCount } = await this.chunks.generateForDocument(
+        doc._id.toString(),
+        doc.fileName,
+      )
+      await this.db.documents.updateOne(
+        { _id: doc._id },
+        { $set: { status: 'completed', pageCount } },
+      )
+      this.logger.log(
+        `Document "${doc.fileName}" processed: ${chunkCount} chunks, ${pageCount} pages`,
+      )
+    } catch (error) {
+      this.logger.error(
+        `Failed to process document "${doc.fileName}": ${(error as Error).message}`,
+      )
+      await this.db.documents
+        .updateOne({ _id: doc._id }, { $set: { status: 'failed' } })
+        .catch(() => {})
+    }
+  }
+
+  /** Cascade delete: GridFS binary, chunks, then the metadata row. */
   async remove(id: string): Promise<{ id: string; deleted: boolean }> {
-    const result = await this.db.documents.deleteOne({ _id: id })
-    if (result.deletedCount === 0) {
+    const doc = await this.db.documents.findById(id)
+    if (!doc) {
       throw new NotFoundException(`Document "${id}" not found`)
     }
+
+    if (doc.gridFsFileId) {
+      try {
+        await this.gridFs.remove(doc.gridFsFileId)
+      } catch (error) {
+        this.logger.warn(
+          `Could not remove GridFS file for "${doc.fileName}": ${(error as Error).message}`,
+        )
+      }
+    }
+
+    await this.chunks.removeForDocument(id)
+    await this.db.documents.deleteOne({ _id: id })
+    this.logger.log(`Deleted document "${doc.fileName}" (${id})`)
     return { id, deleted: true }
   }
 

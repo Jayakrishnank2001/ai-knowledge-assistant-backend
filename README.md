@@ -46,22 +46,55 @@ Set a different port with the `PORT` environment variable (see `.env.example`).
 
 ## How persistence works
 
-Everything is stored in MongoDB through three Mongoose models
-(`src/database/models.ts`):
+The data follows a logical RAG-ready layout. MongoDB ends up with **five
+application collections** (managed by the code) plus the **GridFS collections**
+(maintained automatically by MongoDB — never create or edit them manually):
 
-- `users` — demo account seeded on first boot (`demo@nexa.ai` / `password123`)
-- `documents` — uploaded PDF metadata; status flips `processing -> completed`
-  a few seconds after upload (simulated background job)
-- `conversations` — each contains an embedded array of `messages` with optional
-  `sources` for AI answers
+```
+MongoDB Atlas (db: ai-knowledge-assistant)
+│
+├── users                 ← accounts
+├── documents             ← metadata only: filename, mimeType, size, status,
+│                            pageCount + gridFsFileId pointing at the PDF binary
+├── document_chunks       ← extracted text + embeddings (1536-dim), the data
+│                            RAG retrieval searches
+├── conversations         ← chat thread metadata (title, preview, date)
+├── messages              ← one row per chat message (conversationId -> conversation)
+│
+├── fs.files              ← GridFS (auto) - PDF file metadata
+└── fs.chunks             ← GridFS (auto) - the PDF binary in 255 KB chunks
+```
 
-`DatabaseService` (`src/database/database.service.ts`, marked `@Global`) is the
-single data-access facade all feature services use. It auto-seeds demo data the
-first time the collections are empty, so the frontend always has something to
-show. Data survives server restarts.
+### The document upload pipeline
 
-MongoDB is connected in `src/main.ts` **before** `NestFactory.create()` boots the
-app, so no request can ever race the database connection.
+```
+POST /api/documents (multipart PDF)
+  1. PDF binary → GridFS (fs.files + fs.chunks), returns gridFsFileId
+  2. metadata row → documents   { userId, fileName, mimeType, fileSizeBytes,
+                                  status: "processing", gridFsFileId }
+  3. ~2.5 s later (simulated extraction):
+       text → chunks + embeddings → document_chunks
+       documents.status → "completed", pageCount set from the chunks
+```
+
+Delete cascades: `GridFS binary → document_chunks → documents` row.
+
+### RAG chat flow
+
+```
+POST /api/chat { question }
+  1. embed the question
+  2. rank every document_chunk by cosine similarity (1536-dim embeddings)
+  3. keep the best chunk per document above a similarity floor
+  4. answer = joined chunk texts; sources = { document, page, relevance }
+  5. user + assistant rows → messages, conversation preview/date updated
+```
+
+> Since no embedding model/LLM is wired up yet, `embedText()` is a deterministic
+> mock (stopword-free, singularized, hashed bag of words), and chunk content is
+> generated from a small pool keyed by filename. Both are designed so you can
+> swap in a real embedding model + PDF text extractor without touching the
+> storage layer.
 
 ## Project structure
 
@@ -70,12 +103,16 @@ src/
 ├── main.ts                     # bootstrap: MongoDB connect, CORS, /api prefix, validation
 ├── app.module.ts               # root module wiring all feature modules
 ├── database/                   # @Global Mongoose-backed data layer + seeding
-│   ├── models.ts               # schemas + typed models (users, documents, conversations)
-│   └── database.service.ts     # repository facade (db.users / .documents / .conversations)
+│   ├── models.ts               # schemas + typed models (users, documents,
+│   │                           #   document_chunks, conversations, messages)
+│   └── database.service.ts     # repository facade (db.users / .documents / ...)
+├── documents/                  # list / get / upload / delete
+│   ├── gridfs.service.ts       # GridFS upload/delete wrapper
+│   ├── chunks.service.ts       # chunk generation + cascading cleanup
+│   ├── embedding.util.ts       # mock embedText/cosine similarity/chunk builder
 ├── auth/                       # login, register, /me, logout + AuthGuard
-├── documents/                  # list / get / upload( PDF ) / delete
-├── conversations/              # list / get / create / delete conversations
-├── chat/                       # POST /api/chat, GET .../messages
+├── conversations/              # conversations + messages split into their own models
+├── chat/                       # RAG retrieval over document_chunks (KnowledgeBaseService)
 └── overview/                   # dashboard stats + recent documents
 ```
 

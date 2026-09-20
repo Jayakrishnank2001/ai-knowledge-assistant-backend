@@ -15,18 +15,12 @@ export class OverviewService {
     ])
     const pages = pagesRows.length ? Number(pagesRows[0].total) : 0
 
-    const questionsRows = await this.db.conversations.aggregate([
-      { $unwind: '$messages' },
-      { $match: { 'messages.role': 'assistant' } },
-      { $count: 'answered' },
-    ])
-
     return {
       documents: total,
       pages,
       processedPercent: total ? Math.round((completed / total) * 100) : 0,
       conversations: await this.db.conversations.countDocuments(),
-      questionsAnswered: questionsRows.length ? Number(questionsRows[0].answered) : 0,
+      questionsAnswered: await this.db.messages.countDocuments({ role: 'assistant' }),
     }
   }
 

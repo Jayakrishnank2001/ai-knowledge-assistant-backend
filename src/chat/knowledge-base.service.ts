@@ -1,85 +1,84 @@
 import { Injectable } from '@nestjs/common'
 import { DatabaseService, SourceRef } from '../database/database.service'
-
-interface KnowledgeEntry {
-  documentName: string
-  keywords: string[]
-  content: string
-  page: number
-}
+import {
+  cosineSimilarity,
+  embedText,
+  MIN_SIMILARITY,
+  similarityLabel,
+} from '../documents/embedding.util'
 
 /**
- * A simulated "Retrieval Augmented Generation" (RAG) knowledge base.
+ * Retrieval Augmented Generation (RAG) against `document_chunks`.
  *
- * Real implementation: embed uploaded PDFs, store chunks + embeddings in a
- * vector database (pgvector, Pinecone, ...), find the most similar chunks
- * to the question and feed them to an LLM (OpenAI, Claude, ...).
+ * Flow for every question:
+ *   1. embed the question (mock embedding - swap for a real model later)
+ *   2. rank every stored chunk by cosine similarity
+ *   3. keep the best chunk per document (no duplicate sources), min similarity
+ *   4. build the answer from the top chunk texts + cite their documents/pages
  */
-const ENTRY_POOL: KnowledgeEntry[] = [
-  {
-    documentName: 'Employee Handbook.pdf',
-    keywords: ['working hours', 'work hours', 'lunch', 'remote', 'work from home', 'schedule', 'break'],
-    content:
-      'Standard working hours are **9:00 AM to 5:00 PM**, Monday to Friday. Employees are also allowed a 1-hour lunch break and may request flexible or remote working arrangements through HR.',
-    page: 8,
-  },
-  {
-    documentName: 'Leave Policy.pdf',
-    keywords: ['annual leave', 'leave', 'vacation', 'holiday', 'days off', 'pto', 'days of annual'],
-    content:
-      'Employees are entitled to **24 days** of paid annual leave per year according to the leave policy. Requests should be submitted through the leave portal at least two weeks in advance.',
-    page: 12,
-  },
-  {
-    documentName: 'IT Security Guide.pdf',
-    keywords: ['password', 'security', 'mfa', 'two-factor', 'login', 'credentials', 'passwords'],
-    content:
-      'Passwords must be at least **12 characters** long and include upper/lowercase letters, a number and a symbol. Multi-factor authentication (MFA) is mandatory for all corporate accounts.',
-    page: 5,
-  },
-  {
-    documentName: 'Company Overview.pdf',
-    keywords: ['company', 'about', 'mission', 'product', 'overview', 'what does the company'],
-    content:
-      'The company builds **AI-powered enterprise knowledge tools** that help teams turn internal documents into searchable, answerable knowledge bases.',
-    page: 3,
-  },
-]
-
 @Injectable()
 export class KnowledgeBaseService {
   constructor(private readonly db: DatabaseService) {}
 
   async ask(question: string): Promise<{ answer: string; sources: SourceRef[] }> {
-    const normalized = question.toLowerCase()
+    const questionEmbedding = embedText(question)
+    const chunks = await this.db.chunks.find().exec()
 
-    const score = (entry: KnowledgeEntry) =>
-      entry.keywords.reduce((sum, keyword) => (normalized.includes(keyword) ? sum + 1 : sum), 0)
-
-    const ranked = ENTRY_POOL.map((entry) => ({ entry, score: score(entry) })).sort(
-      (a, b) => b.score - a.score,
-    )
-    const best = ranked[0]
-
-    if (!best || best.score === 0) {
+    if (chunks.length === 0) {
       return this.fallbackAnswer(question)
     }
 
-    const relevance = Math.min(98, 86 + best.score * 3)
+    const ranked = chunks
+      .map((chunk) => ({
+        chunk,
+        score: cosineSimilarity(questionEmbedding, chunk.embedding),
+      }))
+      .sort((a, b) => b.score - a.score)
+
+    // One chunk per document, sorted by relevance, above the similarity floor.
+    const seenDocuments = new Set<string>()
+    const bestPerDocument = ranked
+      .filter(({ chunk }) => {
+        const documentId = chunk.documentId.toString()
+        if (seenDocuments.has(documentId)) return false
+        seenDocuments.add(documentId)
+        return true
+      })
+      .filter(({ score }) => score >= MIN_SIMILARITY)
+      .slice(0, 3)
+
+    if (bestPerDocument.length === 0) {
+      return this.fallbackAnswer(question)
+    }
+
+    const documentIds = bestPerDocument.map(({ chunk }) => chunk.documentId.toString())
+    const documents = await this.db.documents.find({ _id: { $in: documentIds } }).exec()
+    const documentById = new Map(documents.map((doc) => [doc._id.toString(), doc]))
+
+    const sources: SourceRef[] = bestPerDocument.map(({ chunk, score }) => {
+      const document = documentById.get(chunk.documentId.toString())
+      return {
+        name: document?.fileName ?? 'Knowledge base',
+        page: chunk.pageNumber,
+        relevance: similarityLabel(score),
+      }
+    })
+
+    const answer = bestPerDocument.map(({ chunk }) => chunk.content).join('\n\n')
     return {
-      answer: `## Answer\n\n${best.entry.content}\n\nThis answer is grounded in the source document${best.score > 1 ? 's' : ''} below.`,
-      sources: [{ name: best.entry.documentName, page: best.entry.page, relevance: `${relevance}% match` }],
+      answer: `## Answer\n\n${answer}\n\nThis answer is grounded in the source documents below.`,
+      sources,
     }
   }
 
-  /** Used when no keyword matches any known document. */
+  /** Used when the retrieval finds nothing similar enough. */
   private async fallbackAnswer(question: string): Promise<{ answer: string; sources: SourceRef[] }> {
     const newest = await this.db.documents
       .findOne({ status: 'completed' })
       .sort({ uploadedAt: -1 })
       .exec()
     return {
-      answer: `I searched your knowledge base but could not find a direct match for "${question}". Try rephrasing your question or check that the relevant document has finished processing.`,
+      answer: `I searched the knowledge base but could not find a direct match for "${question}". Try rephrasing your question or check that the relevant document has finished processing.`,
       sources: newest
         ? [{ name: newest.fileName, page: 1, relevance: 'No direct match' }]
         : [{ name: 'Knowledge base', page: 1, relevance: 'No direct match' }],
