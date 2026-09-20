@@ -53,6 +53,7 @@ export interface UserEntity {
   email: string
   password: string
   name: string
+  workspaceName?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +136,7 @@ const userSchema = new Schema(
     email: { type: String, required: true, unique: true, lowercase: true },
     password: { type: String, required: true },
     name: { type: String, required: true },
+    workspaceName: { type: String, default: 'Acme knowledge base' },
   },
   { collection: 'users' },
 )

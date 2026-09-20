@@ -1,4 +1,4 @@
-import { IsEmail, IsNotEmpty, IsString, MinLength } from 'class-validator'
+import { IsEmail, IsNotEmpty, IsOptional, IsString, MinLength } from 'class-validator'
 
 export class LoginDto {
   @IsEmail()
@@ -20,4 +20,21 @@ export class RegisterDto {
   @IsString()
   @MinLength(6)
   password!: string
+}
+
+/** All fields optional - only the ones provided are updated. */
+export class UpdateProfileDto {
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  name?: string
+
+  @IsOptional()
+  @IsEmail()
+  email?: string
+
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  workspaceName?: string
 }

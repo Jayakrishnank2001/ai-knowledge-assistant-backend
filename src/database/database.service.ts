@@ -33,7 +33,12 @@ const MB = 1024 * 1024
 const hoursAgo = (h: number): Date => new Date(Date.now() - h * 3_600_000)
 
 const SEED_USERS: UserEntity[] = [
-  { email: 'demo@nexa.ai', password: 'password123', name: 'John Doe' },
+  {
+    email: 'demo@nexa.ai',
+    password: 'password123',
+    name: 'John Doe',
+    workspaceName: 'Acme knowledge base',
+  },
 ]
 
 const SEED_DOCUMENTS: DocumentEntity[] = [
@@ -192,6 +197,15 @@ export class DatabaseService implements OnApplicationBootstrap {
     if ((await this.users.countDocuments()) === 0) {
       await this.users.insertMany(SEED_USERS)
       this.logger.log('Seeded demo user (demo@nexa.ai)')
+    }
+
+    // backfill the workspaceName field for rows created before it existed
+    const backfilled = await this.users.updateMany(
+      { workspaceName: { $exists: false } },
+      { $set: { workspaceName: 'Acme knowledge base' } },
+    )
+    if (backfilled.modifiedCount > 0) {
+      this.logger.log(`Backfilled workspaceName for ${backfilled.modifiedCount} user(s)`)
     }
 
     // documents + document_chunks ------------------------------------------

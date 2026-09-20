@@ -1,11 +1,12 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common'
 import { randomUUID } from 'crypto'
 import { DatabaseService } from '../database/database.service'
-import { LoginDto, RegisterDto } from './dto/auth.dto'
+import { LoginDto, RegisterDto, UpdateProfileDto } from './dto/auth.dto'
 
 /** Minimal slice of a hydrated mongoose document the session logic needs. */
 interface StoredUser {
@@ -13,6 +14,7 @@ interface StoredUser {
   email: string
   password: string
   name: string
+  workspaceName?: string
 }
 
 @Injectable()
@@ -62,6 +64,45 @@ export class AuthService {
     return { success: true }
   }
 
+  /** Update the logged-in user's profile. Only provided fields change. */
+  async updateProfile(userId: string, dto: UpdateProfileDto) {
+    const updates: Record<string, unknown> = {}
+
+    if (dto.name !== undefined) updates.name = dto.name.trim()
+    if (dto.workspaceName !== undefined) updates.workspaceName = dto.workspaceName.trim()
+
+    if (dto.email !== undefined) {
+      const email = dto.email.toLowerCase()
+      const existing = (await this.db.users.findOne({ email })) as StoredUser | null
+      if (existing && existing._id.toString() !== userId) {
+        throw new ConflictException('That email is already in use')
+      }
+      updates.email = email
+    }
+
+    if (Object.keys(updates).length === 0) {
+      throw new BadRequestException('Nothing to update')
+    }
+
+    try {
+      const user = (await this.db.users.findByIdAndUpdate(
+        userId,
+        { $set: updates },
+        { new: true },
+      )) as StoredUser | null
+      if (!user) {
+        throw new UnauthorizedException('Invalid or expired session')
+      }
+      return this.publicUser(user)
+    } catch (error) {
+      // unique index race on email
+      if ((error as { code?: number }).code === 11000) {
+        throw new ConflictException('That email is already in use')
+      }
+      throw error
+    }
+  }
+
   private async findByToken(token: string): Promise<StoredUser> {
     const userId = this.sessions.get(token)
     if (!userId) {
@@ -81,6 +122,11 @@ export class AuthService {
   }
 
   private publicUser(user: StoredUser) {
-    return { id: user._id.toString(), email: user.email, name: user.name }
+    return {
+      id: user._id.toString(),
+      email: user.email,
+      name: user.name,
+      workspaceName: user.workspaceName ?? 'Acme knowledge base',
+    }
   }
 }
