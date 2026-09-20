@@ -3,9 +3,9 @@
 A basic [NestJS](https://nestjs.com/) REST API that powers the
 `ai-knowledge-assistant-frontend` (Next.js / React) app.
 
-> **Status:** starter/educational project. Uses **in-memory storage** (data resets
-> on restart) and a **mock "knowledge base"** that generates answers with sources
-> by keyword matching — no database or LLM yet.
+> **Status:** starter/educational project. Uses **MongoDB Atlas** for persistence
+> and a **mock "knowledge base"** that generates answers with sources by keyword
+> matching — no LLM yet.
 
 ## Tech stack
 
@@ -14,28 +14,64 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 | Runtime            | Node.js 20+                         |
 | Framework          | NestJS 11 (Express under the hood)  |
 | Language           | TypeScript                          |
+| Database           | MongoDB Atlas (via Mongoose ODM)    |
 | File uploads       | Multer (PDF, max 25 MB)             |
-| Storage            | In-memory (no external database)    |
 | Validation         | class-validator + ValidationPipe    |
 
 ## Getting started
 
 ```bash
 npm install
-npm run start:dev     # watch mode on http://localhost:3001
+
+# 1. Put your MongoDB connection string in .env
+cp .env.example .env          # then edit .env -> set MONGODB_URI
+
+npm run start:dev             # watch mode on http://localhost:3001
 # or
 npm run build && npm run start:prod
 ```
 
 Set a different port with the `PORT` environment variable (see `.env.example`).
 
+### Environment variables
+
+| Variable          | Purpose                                                    | Example |
+| ----------------- | ---------------------------------------------------------- | ------- |
+| `PORT`            | HTTP port the API listens on (default `3001`)             | `3001`  |
+| `MONGODB_URI`     | MongoDB connection string                                 | `mongodb+srv://user:pass@cluster0.example.mongodb.net/?appName=Cluster0` |
+| `MONGODB_DBNAME`  | Database name inside the cluster (default `ai-knowledge-assistant`) | `ai-knowledge-assistant` |
+
+> ⚠️ The real connection string lives in `.env` (gitignored). `.env.example` only
+> contains placeholders — never commit real credentials.
+
+## How persistence works
+
+Everything is stored in MongoDB through three Mongoose models
+(`src/database/models.ts`):
+
+- `users` — demo account seeded on first boot (`demo@nexa.ai` / `password123`)
+- `documents` — uploaded PDF metadata; status flips `processing -> completed`
+  a few seconds after upload (simulated background job)
+- `conversations` — each contains an embedded array of `messages` with optional
+  `sources` for AI answers
+
+`DatabaseService` (`src/database/database.service.ts`, marked `@Global`) is the
+single data-access facade all feature services use. It auto-seeds demo data the
+first time the collections are empty, so the frontend always has something to
+show. Data survives server restarts.
+
+MongoDB is connected in `src/main.ts` **before** `NestFactory.create()` boots the
+app, so no request can ever race the database connection.
+
 ## Project structure
 
 ```
 src/
-├── main.ts                     # bootstrap: CORS, /api prefix, validation pipe
+├── main.ts                     # bootstrap: MongoDB connect, CORS, /api prefix, validation
 ├── app.module.ts               # root module wiring all feature modules
-├── database/                   # @Global in-memory store, seeded with demo data
+├── database/                   # @Global Mongoose-backed data layer + seeding
+│   ├── models.ts               # schemas + typed models (users, documents, conversations)
+│   └── database.service.ts     # repository facade (db.users / .documents / .conversations)
 ├── auth/                       # login, register, /me, logout + AuthGuard
 ├── documents/                  # list / get / upload( PDF ) / delete
 ├── conversations/              # list / get / create / delete conversations
@@ -47,7 +83,7 @@ Each feature follows the NestJS layer pattern:
 
 ```
 Controller  -> receives HTTP requests, delegates to service
-Service     -> business logic, uses DatabaseService
+Service     -> business logic (async), uses DatabaseService / other services
 DTO         -> class-validator rules for request bodies
 Module      -> wraps controller + providers for that feature
 ```
@@ -128,7 +164,6 @@ after ~2.5 seconds.
 
 ## What's next
 
-- Swap `DatabaseService` for a real database (TypeORM/Prisma + Postgres).
 - Replace the mock `KnowledgeBaseService` with real RAG: PDF text extraction,
   embeddings + vector search, and an LLM call.
 - Replace the in-memory session tokens with JWT + refresh tokens.

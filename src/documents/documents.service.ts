@@ -1,13 +1,10 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common'
-import {
-  DatabaseService,
-  DocumentEntity,
-  DocumentStatus,
-} from '../database/database.service'
+import { DatabaseService, DocumentStatus } from '../database/database.service'
 
 const MB = 1024 * 1024
 
@@ -21,14 +18,24 @@ export interface DocumentDto {
   pageCount: number
 }
 
+/** Shape of a row returned by MongoDB (entity + the generated _id). */
+interface StoredDocument {
+  _id: { toString(): string }
+  fileName: string
+  fileSizeBytes: number
+  status: DocumentStatus
+  uploadedAt: Date
+  pageCount: number
+}
+
 function formatBytes(bytes: number): string {
   const mb = bytes / MB
   return mb >= 100 ? `${mb.toFixed(0)} MB` : `${mb.toFixed(1)} MB`
 }
 
-function toDto(doc: DocumentEntity): DocumentDto {
+function toDto(doc: StoredDocument): DocumentDto {
   return {
-    id: doc.id,
+    id: doc._id.toString(),
     fileName: doc.fileName,
     fileSize: formatBytes(doc.fileSizeBytes),
     fileSizeBytes: doc.fileSizeBytes,
@@ -40,14 +47,17 @@ function toDto(doc: DocumentEntity): DocumentDto {
 
 @Injectable()
 export class DocumentsService {
+  private readonly logger = new Logger(DocumentsService.name)
+
   constructor(private readonly db: DatabaseService) {}
 
-  list(): DocumentDto[] {
-    return this.db.documents.map(toDto)
+  async list(): Promise<DocumentDto[]> {
+    const docs = await this.db.documents.find().sort({ uploadedAt: -1 }).exec()
+    return docs.map(toDto)
   }
 
-  get(id: string): DocumentDto {
-    const doc = this.db.documents.find((d) => d.id === id)
+  async get(id: string): Promise<DocumentDto> {
+    const doc = await this.db.documents.findById(id)
     if (!doc) {
       throw new NotFoundException(`Document "${id}" not found`)
     }
@@ -55,36 +65,48 @@ export class DocumentsService {
   }
 
   /**
-   * Simulates uploading + processing a PDF.
-   * The record is created as "processing" and flips to "completed"
-   * after a few seconds (in a real app this would be a text extract /
-   * embedding step, often a background job).
+   * Persists an uploaded PDF, initially marked as "processing", then flips it
+   * to "completed" after a few seconds (in a real app this would be a text
+   * extraction / embedding step, often a background job).
    */
-  create(file: Express.Multer.File): DocumentDto {
-    const doc: DocumentEntity = {
-      id: this.db.nextId('doc'),
+  async create(file: Express.Multer.File): Promise<DocumentDto> {
+    const doc = await this.db.documents.create({
       fileName: file.originalname,
       fileSizeBytes: file.size,
-      status: 'processing',
+      status: 'processing' as DocumentStatus,
       uploadedAt: new Date(),
       pageCount: 0,
-    }
-    this.db.documents.push(doc)
+    })
 
     setTimeout(() => {
-      doc.status = 'completed'
-      doc.pageCount = 8 + Math.round(Math.random() * 60)
+      void this.db.documents
+        .updateOne(
+          { _id: doc._id },
+          {
+            $set: {
+              status: 'completed',
+              pageCount: 8 + Math.round(Math.random() * 60),
+            },
+          },
+        )
+        .then((result) =>
+          this.logger.log(
+            `Document "${doc.fileName}" processed (matched=${result.matchedCount}, modified=${result.modifiedCount})`,
+          ),
+        )
+        .catch((error: Error) =>
+          this.logger.error(`Failed to finalize document "${doc.fileName}": ${error.message}`, undefined, 'DocumentsService'),
+        )
     }, 2500)
 
     return toDto(doc)
   }
 
-  remove(id: string): { id: string; deleted: boolean } {
-    const index = this.db.documents.findIndex((d) => d.id === id)
-    if (index === -1) {
+  async remove(id: string): Promise<{ id: string; deleted: boolean }> {
+    const result = await this.db.documents.deleteOne({ _id: id })
+    if (result.deletedCount === 0) {
       throw new NotFoundException(`Document "${id}" not found`)
     }
-    this.db.documents.splice(index, 1)
     return { id, deleted: true }
   }
 

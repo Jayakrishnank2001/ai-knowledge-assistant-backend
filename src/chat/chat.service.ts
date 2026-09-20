@@ -12,22 +12,22 @@ export class ChatService {
 
   /**
    * Accepts a user question:
-   *   1. creates a new conversation (or reuses conversationId)
+   *   1. creates a new conversation (or reuses conversationId) — persisted
    *   2. stores the user message
    *   3. asks the knowledge base for an answer + sources
    *   4. stores the assistant message
    *   5. returns the whole updated conversation
    */
-  askQuestion(dto: AskQuestionDto) {
+  async askQuestion(dto: AskQuestionDto) {
     const question = dto.question.trim()
 
     let conversationId = dto.conversationId
     if (!conversationId) {
-      const created = this.conversations.create({ title: this.titleFrom(question) })
+      const created = await this.conversations.create({ title: this.titleFrom(question) })
       conversationId = created.id
     }
 
-    const { answer, sources } = this.knowledgeBase.ask(question)
+    const { answer, sources } = await this.knowledgeBase.ask(question)
 
     return this.conversations.appendMessages(conversationId, [
       { role: 'user', content: question },
@@ -35,8 +35,9 @@ export class ChatService {
     ])
   }
 
-  messagesOf(conversationId: string) {
-    return this.conversations.getDetail(conversationId).messages
+  async messagesOf(conversationId: string) {
+    const conversation = await this.conversations.getDetail(conversationId)
+    return conversation.messages
   }
 
   /** Turn a question into a short conversation title, e.g. "How many annual leave days do…" */

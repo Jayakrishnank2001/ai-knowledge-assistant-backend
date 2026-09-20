@@ -5,36 +5,39 @@ import { DatabaseService } from '../database/database.service'
 export class OverviewService {
   constructor(private readonly db: DatabaseService) {}
 
-  stats() {
-    const documents = this.db.documents
-    const completed = documents.filter((doc) => doc.status === 'completed')
-    const processedPercent = documents.length
-      ? Math.round((completed.length / documents.length) * 100)
-      : 0
+  async stats() {
+    const total = await this.db.documents.countDocuments()
+    const completed = await this.db.documents.countDocuments({ status: 'completed' })
+
+    const pagesRows = await this.db.documents.aggregate([
+      { $match: { status: 'completed' } },
+      { $group: { _id: null, total: { $sum: '$pageCount' } } },
+    ])
+    const pages = pagesRows.length ? Number(pagesRows[0].total) : 0
+
+    const questionsRows = await this.db.conversations.aggregate([
+      { $unwind: '$messages' },
+      { $match: { 'messages.role': 'assistant' } },
+      { $count: 'answered' },
+    ])
 
     return {
-      documents: documents.length,
-      pages: completed.reduce((sum, doc) => sum + doc.pageCount, 0),
-      processedPercent,
-      conversations: this.db.conversations.length,
-      questionsAnswered: this.db.conversations.reduce(
-        (sum, conv) => sum + conv.messages.filter((m) => m.role === 'assistant').length,
-        0,
-      ),
+      documents: total,
+      pages,
+      processedPercent: total ? Math.round((completed / total) * 100) : 0,
+      conversations: await this.db.conversations.countDocuments(),
+      questionsAnswered: questionsRows.length ? Number(questionsRows[0].answered) : 0,
     }
   }
 
-  recentDocuments() {
-    return this.db.documents
-      .slice()
-      .sort((a, b) => b.uploadedAt.getTime() - a.uploadedAt.getTime())
-      .slice(0, 5)
-      .map((doc) => ({
-        id: doc.id,
-        name: doc.fileName,
-        pages: doc.pageCount,
-        daysAgo: Math.max(0, Math.floor((Date.now() - doc.uploadedAt.getTime()) / 86_400_000)),
-        status: doc.status,
-      }))
+  async recentDocuments() {
+    const docs = await this.db.documents.find().sort({ uploadedAt: -1 }).limit(5).exec()
+    return docs.map((doc) => ({
+      id: doc._id.toString(),
+      name: doc.fileName,
+      pages: doc.pageCount,
+      daysAgo: Math.max(0, Math.floor((Date.now() - doc.uploadedAt.getTime()) / 86_400_000)),
+      status: doc.status,
+    }))
   }
 }

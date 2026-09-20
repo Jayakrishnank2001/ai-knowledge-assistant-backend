@@ -17,7 +17,7 @@ import { AuthService } from './auth.service'
 export class AuthGuard implements CanActivate {
   constructor(private readonly authService: AuthService) {}
 
-  canActivate(context: ExecutionContext): boolean {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest()
     const header: string = request.headers.authorization ?? ''
     const token = header.startsWith('Bearer ') ? header.slice(7) : null
@@ -25,7 +25,7 @@ export class AuthGuard implements CanActivate {
       throw new UnauthorizedException('Missing access token')
     }
     // Attach the current user so route handlers can read request.user
-    request.user = this.authService.me(token)
+    request.user = await this.authService.me(token)
     return true
   }
 }

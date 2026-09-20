@@ -50,7 +50,7 @@ const ENTRY_POOL: KnowledgeEntry[] = [
 export class KnowledgeBaseService {
   constructor(private readonly db: DatabaseService) {}
 
-  ask(question: string): { answer: string; sources: SourceRef[] } {
+  async ask(question: string): Promise<{ answer: string; sources: SourceRef[] }> {
     const normalized = question.toLowerCase()
 
     const score = (entry: KnowledgeEntry) =>
@@ -73,9 +73,11 @@ export class KnowledgeBaseService {
   }
 
   /** Used when no keyword matches any known document. */
-  private fallbackAnswer(question: string): { answer: string; sources: SourceRef[] } {
-    const completed = this.db.documents.filter((doc) => doc.status === 'completed')
-    const newest = completed[completed.length - 1]
+  private async fallbackAnswer(question: string): Promise<{ answer: string; sources: SourceRef[] }> {
+    const newest = await this.db.documents
+      .findOne({ status: 'completed' })
+      .sort({ uploadedAt: -1 })
+      .exec()
     return {
       answer: `I searched your knowledge base but could not find a direct match for "${question}". Try rephrasing your question or check that the relevant document has finished processing.`,
       sources: newest

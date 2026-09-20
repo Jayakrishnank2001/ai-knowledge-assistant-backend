@@ -4,8 +4,16 @@ import {
   UnauthorizedException,
 } from '@nestjs/common'
 import { randomUUID } from 'crypto'
-import { DatabaseService, UserEntity } from '../database/database.service'
+import { DatabaseService } from '../database/database.service'
 import { LoginDto, RegisterDto } from './dto/auth.dto'
+
+/** Minimal slice of a hydrated mongoose document the session logic needs. */
+interface StoredUser {
+  _id: { toString(): string }
+  email: string
+  password: string
+  name: string
+}
 
 @Injectable()
 export class AuthService {
@@ -14,55 +22,65 @@ export class AuthService {
 
   constructor(private readonly db: DatabaseService) {}
 
-  login(dto: LoginDto) {
-    const user = this.db.users.find((u) => u.email === dto.email.toLowerCase())
+  async login(dto: LoginDto) {
+    const user = (await this.db.users.findOne({ email: dto.email.toLowerCase() })) as StoredUser | null
     if (!user || user.password !== dto.password) {
       throw new UnauthorizedException('Invalid email or password')
     }
     return this.createSession(user)
   }
 
-  register(dto: RegisterDto) {
+  async register(dto: RegisterDto) {
     const email = dto.email.toLowerCase()
-    if (this.db.users.some((u) => u.email === email)) {
+    if (await this.db.users.exists({ email })) {
       throw new ConflictException('An account with this email already exists')
     }
-    const user: UserEntity = {
-      id: this.db.nextId('user'),
-      email,
-      password: dto.password,
-      name: dto.name,
+    try {
+      const user = (await this.db.users.create({
+        email,
+        password: dto.password,
+        name: dto.name,
+      })) as StoredUser
+      return this.createSession(user)
+    } catch (error) {
+      // Handle a race between the exists() check and the insert (code 11000)
+      if ((error as { code?: number }).code === 11000) {
+        throw new ConflictException('An account with this email already exists')
+      }
+      throw error
     }
-    this.db.users.push(user)
-    return this.createSession(user)
   }
 
   /** Verify a bearer token and return the logged-in user (throws if invalid). */
-  me(token: string) {
-    const user = this.findByToken(token)
-    return { id: user.id, email: user.email, name: user.name }
+  async me(token: string) {
+    const user = await this.findByToken(token)
+    return this.publicUser(user)
   }
 
-  logout(token: string) {
+  async logout(token: string) {
     this.sessions.delete(token)
     return { success: true }
   }
 
-  private findByToken(token: string): UserEntity {
+  private async findByToken(token: string): Promise<StoredUser> {
     const userId = this.sessions.get(token)
-    const user = this.db.users.find((u) => u.id === userId)
+    if (!userId) {
+      throw new UnauthorizedException('Invalid or expired session')
+    }
+    const user = (await this.db.users.findById(userId)) as StoredUser | null
     if (!user) {
       throw new UnauthorizedException('Invalid or expired session')
     }
     return user
   }
 
-  private createSession(user: UserEntity) {
+  private createSession(user: StoredUser) {
     const token = `token_${randomUUID()}`
-    this.sessions.set(token, user.id)
-    return {
-      token,
-      user: { id: user.id, email: user.email, name: user.name },
-    }
+    this.sessions.set(token, user._id.toString())
+    return { token, user: this.publicUser(user) }
+  }
+
+  private publicUser(user: StoredUser) {
+    return { id: user._id.toString(), email: user.email, name: user.name }
   }
 }
