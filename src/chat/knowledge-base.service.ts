@@ -1,27 +1,30 @@
-import { Injectable } from '@nestjs/common'
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common'
 import { DatabaseService, SourceRef } from '../database/database.service'
-import {
-  cosineSimilarity,
-  embedText,
-  MIN_SIMILARITY,
-  similarityLabel,
-} from '../documents/embedding.util'
+import { cosineSimilarity, similarityLabel } from '../documents/embedding.util'
+import { EmbeddingProvider, EmbeddingProviderFactory } from '../providers/embedding.provider'
+import { LlmProvider, LlmProviderFactory } from '../providers/llm.provider'
 
-/**
- * Retrieval Augmented Generation (RAG) against `document_chunks`.
- *
- * Flow for every question:
- *   1. embed the question (mock embedding - swap for a real model later)
- *   2. rank every stored chunk by cosine similarity
- *   3. keep the best chunk per document (no duplicate sources), min similarity
- *   4. build the answer from the top chunk texts + cite their documents/pages
- */
 @Injectable()
-export class KnowledgeBaseService {
-  constructor(private readonly db: DatabaseService) {}
+export class KnowledgeBaseService implements OnModuleInit {
+  private readonly logger = new Logger(KnowledgeBaseService.name)
+  private embeddingProvider!: EmbeddingProvider
+  private llmProvider!: LlmProvider
+  private readonly MIN_SIMILARITY = 0.12
+
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly embeddingFactory: EmbeddingProviderFactory,
+    private readonly llmFactory: LlmProviderFactory,
+  ) {}
+
+  onModuleInit() {
+    this.embeddingProvider = this.embeddingFactory.getProvider()
+    this.llmProvider = this.llmFactory.getProvider()
+    this.logger.log(`KnowledgeBaseService initialized with ${this.embeddingProvider.constructor.name} + ${this.llmProvider.constructor.name}`)
+  }
 
   async ask(question: string, userId?: string | null): Promise<{ answer: string; sources: SourceRef[] }> {
-    const questionEmbedding = embedText(question)
+    const questionEmbedding = await this.embeddingProvider.embed(question)
 
     // Retrieval scope: the shared knowledge base (userId: null) + the caller's own documents
     const scope = userId ? { $or: [{ userId: null }, { userId }] } : { userId: null }
@@ -33,7 +36,17 @@ export class KnowledgeBaseService {
     )
 
     if (chunks.length === 0) {
-      return this.fallbackAnswer(question)
+      const answer = await this.llmProvider.generateAnswer(question, [])
+      const newest = await this.db.documents
+        .findOne({ status: 'completed' })
+        .sort({ uploadedAt: -1 })
+        .exec()
+      return {
+        answer,
+        sources: newest
+          ? [{ name: newest.fileName, page: 1, relevance: 'No direct match' }]
+          : [{ name: 'Knowledge base', page: 1, relevance: 'No direct match' }],
+      }
     }
 
     const ranked = chunks
@@ -52,11 +65,21 @@ export class KnowledgeBaseService {
         seenDocuments.add(documentId)
         return true
       })
-      .filter(({ score }) => score >= MIN_SIMILARITY)
+      .filter(({ score }) => score >= this.MIN_SIMILARITY)
       .slice(0, 3)
 
     if (bestPerDocument.length === 0) {
-      return this.fallbackAnswer(question)
+      const answer = await this.llmProvider.generateAnswer(question, [])
+      const newest = await this.db.documents
+        .findOne({ status: 'completed' })
+        .sort({ uploadedAt: -1 })
+        .exec()
+      return {
+        answer,
+        sources: newest
+          ? [{ name: newest.fileName, page: 1, relevance: 'No direct match' }]
+          : [{ name: 'Knowledge base', page: 1, relevance: 'No direct match' }],
+      }
     }
 
     const documentIds = bestPerDocument.map(({ chunk }) => chunk.documentId.toString())
@@ -72,24 +95,13 @@ export class KnowledgeBaseService {
       }
     })
 
-    const answer = bestPerDocument.map(({ chunk }) => chunk.content).join('\n\n')
-    return {
-      answer: `## Answer\n\n${answer}\n\nThis answer is grounded in the source documents below.`,
-      sources,
-    }
-  }
+    const context = bestPerDocument.map(({ chunk }) => ({
+      text: chunk.content,
+      documentName: documentById.get(chunk.documentId.toString())?.fileName ?? 'Knowledge base',
+      page: chunk.pageNumber,
+    }))
 
-  /** Used when the retrieval finds nothing similar enough. */
-  private async fallbackAnswer(question: string): Promise<{ answer: string; sources: SourceRef[] }> {
-    const newest = await this.db.documents
-      .findOne({ status: 'completed' })
-      .sort({ uploadedAt: -1 })
-      .exec()
-    return {
-      answer: `I searched the knowledge base but could not find a direct match for "${question}". Try rephrasing your question or check that the relevant document has finished processing.`,
-      sources: newest
-        ? [{ name: newest.fileName, page: 1, relevance: 'No direct match' }]
-        : [{ name: 'Knowledge base', page: 1, relevance: 'No direct match' }],
-    }
+    const answer = await this.llmProvider.generateAnswer(question, context)
+    return { answer, sources }
   }
 }

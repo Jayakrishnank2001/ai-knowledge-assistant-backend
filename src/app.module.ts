@@ -7,6 +7,7 @@ import { DocumentsModule } from './documents/documents.module'
 import { ConversationsModule } from './conversations/conversations.module'
 import { ChatModule } from './chat/chat.module'
 import { OverviewModule } from './overview/overview.module'
+import { ProvidersModule } from './providers/providers.module'
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { OverviewModule } from './overview/overview.module'
     ConversationsModule,
     ChatModule,
     OverviewModule,
+    ProvidersModule,
   ],
   controllers: [AppController],
   providers: [AppService],
