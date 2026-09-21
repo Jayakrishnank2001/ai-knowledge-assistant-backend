@@ -12,31 +12,38 @@ export class ChatService {
 
   /**
    * Accepts a user question:
-   *   1. creates a new conversation (or reuses conversationId) — persisted
+   *   1. creates a new conversation for this user (or reuses conversationId)
    *   2. stores the user message
-   *   3. asks the knowledge base for an answer + sources
+   *   3. asks the knowledge base (shared + own documents only)
    *   4. stores the assistant message
    *   5. returns the whole updated conversation
    */
-  async askQuestion(dto: AskQuestionDto) {
+  async askQuestion(dto: AskQuestionDto, userId: string) {
     const question = dto.question.trim()
 
     let conversationId = dto.conversationId
     if (!conversationId) {
-      const created = await this.conversations.create({ title: this.titleFrom(question) })
+      const created = await this.conversations.create(
+        { title: this.titleFrom(question) },
+        userId,
+      )
       conversationId = created.id
     }
 
-    const { answer, sources } = await this.knowledgeBase.ask(question)
+    const { answer, sources } = await this.knowledgeBase.ask(question, userId)
 
-    return this.conversations.appendMessages(conversationId, [
-      { role: 'user', content: question },
-      { role: 'assistant', content: answer, sources },
-    ])
+    return this.conversations.appendMessages(
+      conversationId,
+      [
+        { role: 'user', content: question },
+        { role: 'assistant', content: answer, sources },
+      ],
+      userId,
+    )
   }
 
-  async messagesOf(conversationId: string) {
-    const conversation = await this.conversations.getDetail(conversationId)
+  async messagesOf(conversationId: string, userId: string) {
+    const conversation = await this.conversations.getDetail(conversationId, userId)
     return conversation.messages
   }
 

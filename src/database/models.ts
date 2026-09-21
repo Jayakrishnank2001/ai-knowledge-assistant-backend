@@ -22,6 +22,7 @@ export interface MessageEntity {
 }
 
 export interface ConversationEntity {
+  userId: string | null
   title: string
   preview: string
   date: Date
@@ -95,12 +96,15 @@ messageSchema.index({ conversationId: 1, timestamp: 1 })
 
 const conversationSchema = new Schema(
   {
+    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     title: { type: String, required: true },
     preview: { type: String, default: '' },
     date: { type: Date, default: Date.now },
   },
   { collection: 'conversations' },
 )
+// "my conversations, newest first"
+conversationSchema.index({ userId: 1, date: -1 })
 
 const documentSchema = new Schema(
   {
@@ -119,6 +123,9 @@ const documentSchema = new Schema(
   },
   { collection: 'documents' },
 )
+
+// "my documents, newest first"
+documentSchema.index({ userId: 1, uploadedAt: -1 })
 
 const documentChunkSchema = new Schema(
   {

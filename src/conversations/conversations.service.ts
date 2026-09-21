@@ -36,6 +36,7 @@ export interface NewMessageInput {
 /** Shape of a row returned by MongoDB (entity + generated ids). */
 interface StoredConversation {
   _id: { toString(): string }
+  userId?: { toString(): string } | null
   title: string
   preview: string
   date: Date
@@ -64,12 +65,19 @@ function messageDto(message: StoredMessage): MessageDto {
   }
 }
 
+/**
+ * Every method is scoped by `userId` (the authenticated user), so users only
+ * ever see and mutate THEIR OWN conversations.
+ */
 @Injectable()
 export class ConversationsService {
   constructor(private readonly db: DatabaseService) {}
 
-  async list(): Promise<ConversationDto[]> {
-    const conversations = await this.db.conversations.find().sort({ date: -1 }).exec()
+  async list(userId: string): Promise<ConversationDto[]> {
+    const conversations = await this.db.conversations
+      .find({ userId })
+      .sort({ date: -1 })
+      .exec()
     return Promise.all(
       conversations.map(async (conv) => ({
         id: objectIdOf(conv),
@@ -81,8 +89,8 @@ export class ConversationsService {
     )
   }
 
-  async getDetail(id: string): Promise<ConversationDetailDto> {
-    const conversation = await this.findOrThrow(id)
+  async getDetail(id: string, userId: string): Promise<ConversationDetailDto> {
+    const conversation = await this.findOwned(id, userId)
     const messages = await this.db.messages
       .find({ conversationId: conversation._id })
       .sort({ timestamp: 1 })
@@ -96,8 +104,9 @@ export class ConversationsService {
     }
   }
 
-  async create(dto?: CreateConversationDto): Promise<ConversationDetailDto> {
+  async create(dto: CreateConversationDto | undefined, userId: string): Promise<ConversationDetailDto> {
     const conversation = await this.db.conversations.create({
+      userId,
       title: dto?.title?.trim() || 'New conversation',
       preview: '',
       date: new Date(),
@@ -115,8 +124,12 @@ export class ConversationsService {
    * Insert new messages into the `messages` collection and refresh the
    * conversation's preview/date. Returns the updated conversation detail.
    */
-  async appendMessages(id: string, inputs: NewMessageInput[]): Promise<ConversationDetailDto> {
-    const conversation = await this.findOrThrow(id)
+  async appendMessages(
+    id: string,
+    inputs: NewMessageInput[],
+    userId: string,
+  ): Promise<ConversationDetailDto> {
+    const conversation = await this.findOwned(id, userId)
     const now = new Date()
 
     await this.db.messages.insertMany(
@@ -136,12 +149,12 @@ export class ConversationsService {
     }
     await this.db.conversations.updateOne({ _id: conversation._id }, { $set: set })
 
-    return this.getDetail(id)
+    return this.getDetail(id, userId)
   }
 
-  /** Delete the conversation and all of its messages. */
-  async remove(id: string): Promise<{ id: string; deleted: boolean }> {
-    const result = await this.db.conversations.deleteOne({ _id: id })
+  /** Delete the conversation (only its owner) and all of its messages. */
+  async remove(id: string, userId: string): Promise<{ id: string; deleted: boolean }> {
+    const result = await this.db.conversations.deleteOne({ _id: id, userId })
     if (result.deletedCount === 0) {
       throw new NotFoundException(`Conversation "${id}" not found`)
     }
@@ -149,8 +162,12 @@ export class ConversationsService {
     return { id, deleted: true }
   }
 
-  private async findOrThrow(id: string): Promise<StoredConversation> {
-    const conversation = (await this.db.conversations.findById(id)) as StoredConversation | null
+  /** Load a conversation and 404 unless it belongs to this user. */
+  private async findOwned(id: string, userId: string): Promise<StoredConversation> {
+    const conversation = (await this.db.conversations.findOne({
+      _id: id,
+      userId,
+    })) as StoredConversation | null
     if (!conversation) {
       throw new NotFoundException(`Conversation "${id}" not found`)
     }

@@ -16,5 +16,7 @@ const signOptions: JwtModuleOptions['signOptions'] = {
   imports: [JwtModule.register({ secret: process.env.JWT_SECRET, signOptions })],
   controllers: [AuthController],
   providers: [AuthService, AuthGuard],
+  // exported so guard-protected modules can resolve AuthGuard + its dependency
+  exports: [AuthService, AuthGuard],
 })
 export class AuthModule {}

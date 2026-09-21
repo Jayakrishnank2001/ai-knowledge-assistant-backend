@@ -31,6 +31,14 @@ npm run start:dev             # watch mode on http://localhost:3001
 npm run build && npm run start:prod
 ```
 
+## Troubleshooting
+
+**`npm test` finds no tests** ("No tests found", `testMatch ... 0 matches`): the repo
+lives inside `OneDrive/Documents`, and OneDrive can mark committed files as
+*cloud-only placeholders* that jest 29's filesystem API silently skips. Fix: make
+a fresh local copy of the file (delete + restore it, or copy to a new name and
+back). Pinning the folder locally in OneDrive avoids the issue entirely.
+
 Set a different port with the `PORT` environment variable (see `.env.example`).
 
 ### Environment variables
@@ -95,6 +103,26 @@ POST /api/chat { question }
 > generated from a small pool keyed by filename. Both are designed so you can
 > swap in a real embedding model + PDF text extractor without touching the
 > storage layer.
+
+### Access control (per-user scoping)
+
+Every route except `/` and `/api/health` requires a **Bearer JWT**.
+
+- **Documents** — `userId: null` rows are the **shared company knowledge base**
+  (visible to every user, not deletable by regular accounts). A user's own
+  uploads (`userId` set) are private: only the owner sees them and only the
+  owner can delete them.
+- **Conversations + messages** — fully private. Every conversation belongs to
+  exactly one user; reading, continuing, or deleting someone else's
+  conversation returns 404.
+- **RAG retrieval** — a question only matches chunks from the shared knowledge
+  base plus the asker's own documents.
+
+```bash
+# Demo isolation check (after login):
+curl.exe -H "Authorization: Bearer $TOKEN" \
+  http://localhost:3001/api/conversations        # only YOUR conversations
+```
 
 ## Project structure
 

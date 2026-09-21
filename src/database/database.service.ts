@@ -221,6 +221,31 @@ export class DatabaseService implements OnApplicationBootstrap {
       this.logger.log(`Backfilled workspaceName for ${backfilled.modifiedCount} user(s)`)
     }
 
+    // the demo user owns the seeded conversations (chat history is per-user)
+    const demoUser = (await this.users.findOne({ email: 'demo@nexa.ai' })) as
+      | { _id: { toString(): string } }
+      | null
+
+    // migrations for rows created before per-user scoping existed -----------
+    if (demoUser) {
+      const convBackfilled = await this.conversations.updateMany(
+        { userId: { $exists: false } },
+        { $set: { userId: demoUser._id } },
+      )
+      if (convBackfilled.modifiedCount > 0) {
+        this.logger.log(
+          `Assigned ${convBackfilled.modifiedCount} legacy conversation(s) to the demo user`,
+        )
+      }
+    }
+    const docBackfilled = await this.documents.updateMany(
+      { userId: { $exists: false } },
+      { $set: { userId: null } }, // null = shared company knowledge
+    )
+    if (docBackfilled.modifiedCount > 0) {
+      this.logger.log(`Marked ${docBackfilled.modifiedCount} legacy document(s) as shared`)
+    }
+
     // documents + document_chunks ------------------------------------------
     if ((await this.documents.countDocuments()) === 0) {
       const docs = await this.documents.insertMany(SEED_DOCUMENTS)
@@ -243,9 +268,10 @@ export class DatabaseService implements OnApplicationBootstrap {
     }
 
     // conversations + messages ----------------------------------------------
-    if ((await this.conversations.countDocuments()) === 0) {
+    if ((await this.conversations.countDocuments()) === 0 && demoUser) {
       const inserted = await this.conversations.insertMany(
         SEED_CONVERSATIONS.map((conv) => ({
+          userId: demoUser._id,
           title: conv.title,
           preview: conv.preview,
           date: conv.date,

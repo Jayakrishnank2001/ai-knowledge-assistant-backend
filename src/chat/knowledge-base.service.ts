@@ -20,9 +20,17 @@ import {
 export class KnowledgeBaseService {
   constructor(private readonly db: DatabaseService) {}
 
-  async ask(question: string): Promise<{ answer: string; sources: SourceRef[] }> {
+  async ask(question: string, userId?: string | null): Promise<{ answer: string; sources: SourceRef[] }> {
     const questionEmbedding = embedText(question)
-    const chunks = await this.db.chunks.find().exec()
+
+    // Retrieval scope: the shared knowledge base (userId: null) + the caller's own documents
+    const scope = userId ? { $or: [{ userId: null }, { userId }] } : { userId: null }
+    const accessibleDocs = await this.db.documents.find(scope, { _id: 1 }).exec()
+    const accessibleIds = new Set(accessibleDocs.map((doc) => doc._id.toString()))
+
+    const chunks = (await this.db.chunks.find().exec()).filter((chunk) =>
+      accessibleIds.has(chunk.documentId.toString()),
+    )
 
     if (chunks.length === 0) {
       return this.fallbackAnswer(question)

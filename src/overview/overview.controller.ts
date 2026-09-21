@@ -1,6 +1,8 @@
-import { Controller, Get } from '@nestjs/common'
+import { Controller, Get, UseGuards } from '@nestjs/common'
+import { AuthGuard } from '../auth/auth.guard'
 import { OverviewService } from './overview.service'
 
+@UseGuards(AuthGuard)
 @Controller('overview')
 export class OverviewController {
   constructor(private readonly overviewService: OverviewService) {}

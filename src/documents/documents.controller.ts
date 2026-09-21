@@ -6,25 +6,34 @@ import {
   Get,
   Param,
   Post,
+  Req,
   UploadedFile,
+  UseGuards,
   UseInterceptors,
 } from '@nestjs/common'
 import { FileInterceptor } from '@nestjs/platform-express'
 import { memoryStorage } from 'multer'
+import { Request } from 'express'
+import { AuthGuard } from '../auth/auth.guard'
 import { DocumentsService } from './documents.service'
 
+interface AuthenticatedRequest extends Request {
+  user: { id: string; email: string; name: string }
+}
+
+@UseGuards(AuthGuard)
 @Controller('documents')
 export class DocumentsController {
   constructor(private readonly documentsService: DocumentsService) {}
 
   @Get()
-  list() {
-    return this.documentsService.list()
+  list(@Req() request: AuthenticatedRequest) {
+    return this.documentsService.list(request.user.id)
   }
 
   @Get(':id')
-  get(@Param('id') id: string) {
-    return this.documentsService.get(id)
+  get(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
+    return this.documentsService.get(id, request.user.id)
   }
 
   /**
@@ -40,15 +49,18 @@ export class DocumentsController {
       fileFilter: DocumentsService.pdfFileFilter,
     }),
   )
-  upload(@UploadedFile() file?: Express.Multer.File) {
+  upload(
+    @Req() request: AuthenticatedRequest,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
     if (!file) {
       throw new BadRequestException('No file uploaded — did you send a "file" field?')
     }
-    return this.documentsService.create(file)
+    return this.documentsService.create(file, request.user.id)
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
-    return this.documentsService.remove(id)
+  remove(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
+    return this.documentsService.remove(id, request.user.id)
   }
 }

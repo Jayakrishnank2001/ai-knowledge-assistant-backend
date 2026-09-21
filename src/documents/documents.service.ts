@@ -59,13 +59,19 @@ export class DocumentsService {
     private readonly chunks: ChunksService,
   ) {}
 
-  async list(): Promise<DocumentDto[]> {
-    const docs = await this.db.documents.find().sort({ uploadedAt: -1 }).exec()
+  async list(userId: string): Promise<DocumentDto[]> {
+    const docs = await this.db.documents
+      .find({ $or: [{ userId: null }, { userId }] })
+      .sort({ uploadedAt: -1 })
+      .exec()
     return docs.map(toDto)
   }
 
-  async get(id: string): Promise<DocumentDto> {
-    const doc = await this.db.documents.findById(id)
+  async get(id: string, userId: string): Promise<DocumentDto> {
+    const doc = await this.db.documents.findOne({
+      _id: id,
+      $or: [{ userId: null }, { userId }],
+    })
     if (!doc) {
       throw new NotFoundException(`Document "${id}" not found`)
     }
@@ -80,7 +86,7 @@ export class DocumentsService {
    *   3. after a short "processing" delay, extract chunks + embeddings into
    *      `document_chunks` and mark the document completed
    */
-  async create(file: Express.Multer.File): Promise<DocumentDto> {
+  async create(file: Express.Multer.File, userId: string): Promise<DocumentDto> {
     if (!file.buffer || file.buffer.length === 0) {
       throw new BadRequestException('The uploaded file is empty')
     }
@@ -90,7 +96,7 @@ export class DocumentsService {
     })
 
     const doc = await this.db.documents.create({
-      userId: null, // no auth-scoped uploads yet; wired up for the future
+      userId,
       fileName: file.originalname,
       mimeType: file.mimetype,
       fileSizeBytes: file.size,
@@ -131,9 +137,9 @@ export class DocumentsService {
     }
   }
 
-  /** Cascade delete: GridFS binary, chunks, then the metadata row. */
-  async remove(id: string): Promise<{ id: string; deleted: boolean }> {
-    const doc = await this.db.documents.findById(id)
+  /** Cascade delete: GridFS binary, chunks, then the metadata row. Only owners can delete. */
+  async remove(id: string, userId: string): Promise<{ id: string; deleted: boolean }> {
+    const doc = await this.db.documents.findOne({ _id: id, userId })
     if (!doc) {
       throw new NotFoundException(`Document "${id}" not found`)
     }
@@ -149,7 +155,7 @@ export class DocumentsService {
     }
 
     await this.chunks.removeForDocument(id)
-    await this.db.documents.deleteOne({ _id: id })
+    await this.db.documents.deleteOne({ _id: id, userId })
     this.logger.log(`Deleted document "${doc.fileName}" (${id})`)
     return { id, deleted: true }
   }
