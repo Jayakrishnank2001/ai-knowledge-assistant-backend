@@ -35,6 +35,22 @@ export class GridFsService {
     })
   }
 
+  /**
+   * Read a GridFS file back into memory.
+   * Used when re-extracting text from documents that were uploaded earlier.
+   */
+  async download(fileId: ObjectId | string): Promise<Buffer> {
+    const bucket = this.bucket()
+    const id = new ObjectId(fileId.toString())
+    return new Promise<Buffer>((resolve, reject) => {
+      const parts: Buffer[] = []
+      const stream = bucket.openDownloadStream(id)
+      stream.on('data', (chunk: Buffer) => parts.push(chunk))
+      stream.once('error', reject)
+      stream.once('end', () => resolve(Buffer.concat(parts)))
+    })
+  }
+
   /** Delete a GridFS file (and its chunks) by fs.files._id. */
   async remove(fileId: ObjectId | string): Promise<void> {
     const bucket = this.bucket()

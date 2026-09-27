@@ -3,9 +3,9 @@
 A basic [NestJS](https://nestjs.com/) REST API that powers the
 `ai-knowledge-assistant-frontend` (Next.js / React) app.
 
-> **Status:** starter/educational project. Uses **MongoDB Atlas** for persistence
-> and a **mock "knowledge base"** that generates answers with sources by keyword
-> matching — no LLM yet.
+> **Status:** working RAG pipeline backed by **MongoDB Atlas** (+ Atlas Vector
+> Search), **Gemini embeddings** (`gemini-embedding-001`) and a **Gemini chat
+> model** — with an offline mock fallback when no `GEMINI_API_KEY` is set.
 
 ## Tech stack
 
@@ -16,6 +16,10 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 | Language           | TypeScript                          |
 | Database           | MongoDB Atlas (via Mongoose ODM)    |
 | File uploads       | Multer (PDF, max 25 MB)             |
+| PDF text           | pdf-parse v2 (pdf.js, per-page text) |
+| Embeddings         | Gemini gemini-embedding-001 (1536-dim), offline mock fallback |
+| Chat answers       | Gemini chat model (see GEMINI_CHAT_MODEL) |
+| Vector search      | Atlas Vector Search ($vectorSearch) + in-process cosine fallback |
 | Validation         | class-validator + ValidationPipe    |
 
 ## Getting started
@@ -24,14 +28,33 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 npm install
 
 # 1. Put your MongoDB connection string in .env
-cp .env.example .env          # then edit .env -> set MONGODB_URI
+cp .env.example .env          # then edit .env -> set MONGODB_URI + GEMINI_API_KEY
 
 npm run start:dev             # watch mode on http://localhost:3001
 # or
 npm run build && npm run start:prod
+
+# After changing the embedding model (or upgrading from placeholder chunks):
+npm run reindex               # re-extract + re-embed every document from GridFS
 ```
 
 ## Troubleshooting
+
+**`npm run start:dev` crashes with `ERR_REQUIRE_ESM` / *"require() of ES Module ...
+not supported"***: `@nestjs/config` v12+ is published as **ESM-only** (`"type": "module"`),
+which cannot be `require()`d from this project's CommonJS build (see
+`tsconfig.json` → `"module": "commonjs"`). Stay on the last CommonJS release,
+`@nestjs/config@^4.0.4`, which supports NestJS 11. Do **not** upgrade it to v12
+unless the whole project is migrated to ESM.
+
+**`MongooseServerSelectionError` / *"tlsv1 alert internal error"* / *"IP that isn't
+whitelisted"***: the code compiled and booted, but MongoDB Atlas refused the
+connection. DNS and TCP (port 27017) resolve fine — Atlas aborts the TLS
+handshake before authentication when the calling IP is not authorised. Fix:
+Atlas dashboard → **Network Access** → **Add IP Address** → *Add Current IP
+Address* (or `0.0.0.0/0` for local development only), wait for the entry to show
+as **Active**, then re-run `npm run start:dev`. `src/main.ts` prints this hint
+directly instead of dumping the raw driver stack trace.
 
 **`npm test` finds no tests** ("No tests found", `testMatch ... 0 matches`): the repo
 lives inside `OneDrive/Documents`, and OneDrive can mark committed files as
@@ -48,6 +71,12 @@ Set a different port with the `PORT` environment variable (see `.env.example`).
 | `PORT`            | HTTP port the API listens on (default `3001`)             | `3001`  |
 | `MONGODB_URI`     | MongoDB connection string                                 | `mongodb+srv://user:pass@cluster0.example.mongodb.net/?appName=Cluster0` |
 | `MONGODB_DBNAME`  | Database name inside the cluster (default `ai-knowledge-assistant`) | `ai-knowledge-assistant` |
+| `GEMINI_API_KEY`  | Google Gemini key (enables real embeddings + answers)    | `AIza...` |
+| `GEMINI_EMBEDDING_MODEL` | Embedding model - keep 1536-dim output, then `npm run reindex` | `gemini-embedding-001` |
+| `GEMINI_CHAT_MODEL` | Chat model for answers                                    | `gemini-2.5-flash` |
+| `RAG_MIN_SIMILARITY` | Cosine floor for retrieval (default: 0.12 mock / 0.5 Gemini) | `0.5` |
+| `RAG_TOP_K`       | Max chunks handed to the LLM (default `6`)                | `6` |
+| `RAG_MAX_CHUNKS_PER_DOCUMENT` | Max chunks per document (default `3`)        | `3` |
 
 > ⚠️ The real connection string lives in `.env` (gitignored). `.env.example` only
 > contains placeholders — never commit real credentials.
@@ -80,9 +109,13 @@ POST /api/documents (multipart PDF)
   1. PDF binary → GridFS (fs.files + fs.chunks), returns gridFsFileId
   2. metadata row → documents   { userId, fileName, mimeType, fileSizeBytes,
                                   status: "processing", gridFsFileId }
-  3. ~2.5 s later (simulated extraction):
-       text → chunks + embeddings → document_chunks
-       documents.status → "completed", pageCount set from the chunks
+  3. in the background (real extraction - the response is not held open):
+       pdf-parse text (per page) → sentence-boundary chunks (1000 chars,
+       200-char overlap, never splits a word) → provider embeddings
+       → document_chunks
+       documents.status → "completed" (pageCount from the extracted pages)
+       - unreadable PDFs: status → "failed" with a logged reason
+       - scanned/image-only PDFs: status → "failed" (no extractable text)
 ```
 
 Delete cascades: `GridFS binary → document_chunks → documents` row.
@@ -91,18 +124,26 @@ Delete cascades: `GridFS binary → document_chunks → documents` row.
 
 ```
 POST /api/chat { question }
-  1. embed the question
-  2. rank every document_chunk by cosine similarity (1536-dim embeddings)
-  3. keep the best chunk per document above a similarity floor
-  4. answer = joined chunk texts; sources = { document, page, relevance }
+  1. embed the question with the SAME provider that indexed the documents
+     (Gemini: RETRIEVAL_QUERY task type; mock: hashed bag-of-words)
+  2. retrieve candidates:
+       Atlas $vectorSearch (indexed, scoped to the user's documents) when the
+       "document_chunks_vector_index" is queryable, otherwise an in-process
+       cosine scan of the user's chunks
+  3. re-rank every candidate with exact cosine similarity via rankChunks():
+       drop mismatched vector widths (stale models), drop below
+       RAG_MIN_SIMILARITY, cap RAG_MAX_CHUNKS_PER_DOCUMENT per document,
+       keep top RAG_TOP_K overall
+  4. Gemini answers from the surviving chunks; sources = { document, page, relevance }
   5. user + assistant rows → messages, conversation preview/date updated
 ```
 
-> Since no embedding model/LLM is wired up yet, `embedText()` is a deterministic
-> mock (stopword-free, singularized, hashed bag of words), and chunk content is
-> generated from a small pool keyed by filename. Both are designed so you can
-> swap in a real embedding model + PDF text extractor without touching the
-> storage layer.
+> The embedding model is picked once at startup: `GEMINI_API_KEY` set →
+> Gemini (`gemini-embedding-001`, 1536-dim), otherwise an offline deterministic
+> mock (keyword-based, not semantic). **Indexed vectors and the question vector
+> must come from the same model** - changing models requires
+> `npm run reindex`, otherwise old chunks are skipped as dimension mismatches
+> (and usually score NaN → filtered as "no context").
 
 ### Access control (per-user scoping)
 

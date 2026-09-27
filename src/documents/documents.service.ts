@@ -7,6 +7,7 @@ import {
 import { DatabaseService, DocumentStatus } from '../database/database.service'
 import { ChunksService } from './chunks.service'
 import { GridFsService } from './gridfs.service'
+import { PdfTextService } from './pdf-text.service'
 
 const MB = 1024 * 1024
 
@@ -57,6 +58,7 @@ export class DocumentsService {
     private readonly db: DatabaseService,
     private readonly gridFs: GridFsService,
     private readonly chunks: ChunksService,
+    private readonly pdfText: PdfTextService,
   ) {}
 
   async list(userId: string): Promise<DocumentDto[]> {
@@ -83,8 +85,9 @@ export class DocumentsService {
    *   1. store the PDF binary in GridFS (fs.files / fs.chunks are created
    *      automatically; GridFS never shows up as an application collection)
    *   2. insert the `documents` metadata row with a reference to the GridFS id
-   *   3. after a short "processing" delay, extract chunks + embeddings into
-   *      `document_chunks` and mark the document completed
+   *   3. extract the real text, chunk + embed it into `document_chunks`, and
+   *      mark the document completed (in the background, so the HTTP response
+   *      is not held open)
    */
   async create(file: Express.Multer.File, userId: string): Promise<DocumentDto> {
     if (!file.buffer || file.buffer.length === 0) {
@@ -106,26 +109,36 @@ export class DocumentsService {
       gridFsFileId,
     })
 
-    setTimeout(() => {
-      void this.processDocument(doc)
-    }, 2500)
+    // Real extraction + embedding: hand it off so the upload response returns
+    // immediately, and let processDocument record success or failure.
+    void this.processDocument(doc, file.buffer)
 
     return toDto(doc)
   }
 
-  /** Extract chunks + embeddings, then flip the document to completed. */
-  private async processDocument(doc: StoredDocument): Promise<void> {
+  /**
+   * Extracts the PDF text, chunks + embeds it, then flips the document to
+   * completed. Every failure (unreadable PDF, no extractable text, embedding
+   * API error) marks the document failed with a logged reason rather than
+   * leaving it stuck on "processing" forever.
+   */
+  private async processDocument(doc: StoredDocument, buffer: Buffer): Promise<void> {
     try {
+      const pages = await this.pdfText.extract(buffer)
+      if (pages.length === 0) {
+        throw new Error('no extractable text - is this a scanned/image-only PDF?')
+      }
+
       const { chunkCount, pageCount } = await this.chunks.generateForDocument(
         doc._id.toString(),
-        doc.fileName,
+        pages,
       )
       await this.db.documents.updateOne(
         { _id: doc._id },
         { $set: { status: 'completed', pageCount } },
       )
       this.logger.log(
-        `Document "${doc.fileName}" processed: ${chunkCount} chunks, ${pageCount} pages`,
+        `Document "${doc.fileName}" processed: ${chunkCount} chunk(s), ${pageCount} page(s)`,
       )
     } catch (error) {
       this.logger.error(

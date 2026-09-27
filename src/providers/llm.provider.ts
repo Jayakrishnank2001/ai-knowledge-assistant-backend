@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
-import { OpenAI } from 'openai'
+import { GoogleGenAI } from '@google/genai'
 
 /** Normalised LLM interface - all providers must implement this. */
 export interface LlmProvider {
@@ -35,23 +35,23 @@ export class MockLlmProvider implements LlmProvider {
 }
 
 /**
- * OpenAI chat completion provider (gpt-4o-mini by default).
- * Only instantiated when OPENAI_API_KEY is set.
+ * Google Gemini chat provider (gemini-1.5-pro by default).
+ * Only instantiated when GEMINI_API_KEY is set.
  */
 @Injectable()
-export class OpenAILlmProvider implements LlmProvider {
-  private readonly logger = new Logger(OpenAILlmProvider.name)
-  private readonly client: OpenAI
+export class GeminiLlmProvider implements LlmProvider {
+  private readonly logger = new Logger(GeminiLlmProvider.name)
+  private readonly ai: GoogleGenAI
   private readonly model: string
 
   constructor(private readonly config: ConfigService) {
-    const apiKey = this.config.get<string>('OPENAI_API_KEY')
+    const apiKey = this.config.get<string>('GEMINI_API_KEY')
     if (!apiKey) {
-      throw new Error('OPENAI_API_KEY is not set - cannot create OpenAILlmProvider')
+      throw new Error('GEMINI_API_KEY is not set - cannot create GeminiLlmProvider')
     }
-    this.client = new OpenAI({ apiKey })
-    this.model = this.config.get<string>('OPENAI_CHAT_MODEL') ?? 'gpt-4o-mini'
-    this.logger.log(`OpenAILlmProvider ready (model: ${this.model})`)
+    this.ai = new GoogleGenAI({ apiKey })
+    this.model = this.config.get<string>('GEMINI_CHAT_MODEL') ?? 'gemini-2.5-flash'
+    this.logger.log(`GeminiLlmProvider ready (model: ${this.model})`)
   }
 
   async generateAnswer(
@@ -71,17 +71,20 @@ Rules:
 
 Context:\n${contextText}`
 
-    const response = await this.client.chat.completions.create({
+    const response = await this.ai.models.generateContent({
       model: this.model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: question },
-      ],
-      temperature: 0.1,
-      max_tokens: 800,
+      contents: `Context:\n${contextText || '(no matching documents were found)'}\n\nQuestion: ${question}`,
+      config: {
+        systemInstruction: systemPrompt,
+        temperature: 0.1,
+        // Thinking models (e.g. gemini-3.x-flash) spend part of this budget on
+        // reasoning tokens, so keep it well above the expected answer length -
+        // too small and `response.text` comes back empty.
+        maxOutputTokens: 4096,
+      },
     })
 
-    return response.choices[0].message.content ?? 'No answer generated.'
+    return response.text?.trim() || 'No answer generated.'
   }
 }
 
@@ -96,11 +99,11 @@ export class LlmProviderFactory {
   ) {}
 
   getProvider(): LlmProvider {
-    if (this.config.get<string>('OPENAI_API_KEY')) {
-      this.logger.log('Using OpenAILlmProvider')
-      return new OpenAILlmProvider(this.config)
+    if (this.config.get<string>('GEMINI_API_KEY')) {
+      this.logger.log('Using GeminiLlmProvider')
+      return new GeminiLlmProvider(this.config)
     }
-    this.logger.log('Using MockLlmProvider (no OPENAI_API_KEY set)')
+    this.logger.log('Using MockLlmProvider (no GEMINI_API_KEY set)')
     return this.mock
   }
 }

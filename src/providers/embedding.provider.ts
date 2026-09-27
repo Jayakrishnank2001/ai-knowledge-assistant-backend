@@ -1,81 +1,133 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
-import { OpenAI } from 'openai'
-import { embedText } from '../documents/embedding.util'
+import { GoogleGenAI } from '@google/genai'
+import { EMBEDDING_DIM, embedText } from '../documents/embedding.util'
+
+/** Gemini task types: queries and documents are embedded asymmetrically. */
+type GeminiTaskType = 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT'
 
 /**
- * Normalised embedding interface - all providers must implement this.
- * Vectors are expected to be L2-normalised already.
+ * An embedding model.
+ *
+ * Indexing and querying MUST go through the same provider: two different models
+ * return vectors in different spaces (and often different widths), and mixing
+ * them silently destroys every similarity score.
  */
 export interface EmbeddingProvider {
-  /** Embed a single text and return a normalised vector. */
-  embed(text: string): Promise<number[]>
-
-  /** Embed multiple texts in a single batch call (more efficient). */
-  embedMany(texts: string[]): Promise<number[][]>
-
-  /** The dimensionality this provider returns (e.g. 1536 for text-embedding-3-small). */
+  readonly name: string
+  /** Width of every vector this provider returns. */
   readonly dimensions: number
+  /** Default cosine floor for retrieval (RAG_MIN_SIMILARITY overrides it). */
+  readonly defaultMinSimilarity: number
+  /** Embed one search query (asymmetric retrieval: query task type). */
+  embedQuery(text: string): Promise<number[]>
+  /** Embed chunk texts for indexing (document task type, batched). */
+  embedDocuments(texts: string[]): Promise<number[][]>
 }
 
 /**
- * Deterministic, zero-dependency mock provider (current behaviour).
- * Uses a stopword-free, singularised bag-of-hashed-words vector.
+ * Fails loudly if a provider returns a vector the Atlas Vector Search index
+ * cannot use, instead of letting a bad width become a silent "no results".
+ */
+export function assertVectorWidth(vector: number[], expected: number, context: string): void {
+  const actual = Array.isArray(vector) ? vector.length : 'none'
+  if (actual !== expected) {
+    throw new Error(
+      `${context}: expected a ${expected}-dimension embedding but received ${actual}. ` +
+        'Re-index the documents (npm run reindex) after changing embedding models.',
+    )
+  }
+}
+
+/**
+ * Offline fallback: deterministic hashed bag-of-words. No network, no API key,
+ * but keyword-based rather than semantic.
  */
 @Injectable()
 export class MockEmbeddingProvider implements EmbeddingProvider {
   private readonly logger = new Logger(MockEmbeddingProvider.name)
-  readonly dimensions = 1536
+  readonly name = 'MockEmbeddingProvider'
+  readonly dimensions = EMBEDDING_DIM
+  readonly defaultMinSimilarity = 0.12
 
-  async embed(text: string): Promise<number[]> {
+  async embedQuery(text: string): Promise<number[]> {
     return embedText(text)
   }
 
-  async embedMany(texts: string[]): Promise<number[][]> {
-    return Promise.all(texts.map((t) => this.embed(t)))
+  async embedDocuments(texts: string[]): Promise<number[][]> {
+    return texts.map((text) => embedText(text))
   }
 }
 
+/** Gemini caps how many inputs one embed request may carry. */
+const GEMINI_BATCH_SIZE = 32
+
 /**
- * OpenAI embedding provider (text-embedding-3-small by default).
- * Only instantiated when OPENAI_API_KEY is set.
+ * Google Gemini embeddings (gemini-embedding-001 by default).
+ *
+ * `outputDimensionality` pins the width to EMBEDDING_DIM so switching between
+ * this provider and the mock never changes the vector width - only the space
+ * (which still requires a re-index to be meaningful).
  */
 @Injectable()
-export class OpenAIEmbeddingProvider implements EmbeddingProvider {
-  private readonly logger = new Logger(OpenAIEmbeddingProvider.name)
-  private readonly client: OpenAI
-  readonly dimensions = 1536
+export class GeminiEmbeddingProvider implements EmbeddingProvider {
+  private readonly logger = new Logger(GeminiEmbeddingProvider.name)
+  readonly name = 'GeminiEmbeddingProvider'
+  readonly dimensions = EMBEDDING_DIM
+  readonly defaultMinSimilarity: number
+  private readonly ai: GoogleGenAI
+  private readonly model: string
 
   constructor(private readonly config: ConfigService) {
-    const apiKey = this.config.get<string>('OPENAI_API_KEY')
+    const apiKey = this.config.get<string>('GEMINI_API_KEY')
     if (!apiKey) {
-      throw new Error('OPENAI_API_KEY is not set - cannot create OpenAIEmbeddingProvider')
+      throw new Error('GEMINI_API_KEY is not set - cannot create GeminiEmbeddingProvider')
     }
-    this.client = new OpenAI({ apiKey })
-    this.logger.log(`OpenAIEmbeddingProvider ready (model: ${this.config.get('OPENAI_EMBEDDING_MODEL') ?? 'text-embedding-3-small'})`)
+    this.ai = new GoogleGenAI({ apiKey })
+    this.model = this.config.get<string>('GEMINI_EMBEDDING_MODEL') ?? 'gemini-embedding-001'
+    this.defaultMinSimilarity = Number(this.config.get<string>('RAG_MIN_SIMILARITY') ?? 0.5)
+    this.logger.log(`${this.name} ready (model: ${this.model}, ${this.dimensions}-dim)`)
   }
 
-  async embed(text: string): Promise<number[]> {
-    const model = this.config.get<string>('OPENAI_EMBEDDING_MODEL') ?? 'text-embedding-3-small'
-    const response = await this.client.embeddings.create({ model, input: text })
-    return response.data[0].embedding as number[]
+  async embedQuery(text: string): Promise<number[]> {
+    const [vector] = await this.embed([text], 'RETRIEVAL_QUERY')
+    assertVectorWidth(vector, this.dimensions, 'Gemini embedQuery')
+    return vector
   }
 
-  async embedMany(texts: string[]): Promise<number[][]> {
-    const model = this.config.get<string>('OPENAI_EMBEDDING_MODEL') ?? 'text-embedding-3-small'
-    const response = await this.client.embeddings.create({ model, input: texts })
-    return response.data.map((d) => d.embedding as number[])
+  async embedDocuments(texts: string[]): Promise<number[][]> {
+    if (texts.length === 0) return []
+
+    const vectors: number[][] = []
+    for (let i = 0; i < texts.length; i += GEMINI_BATCH_SIZE) {
+      const batch = texts.slice(i, i + GEMINI_BATCH_SIZE)
+      vectors.push(...(await this.embed(batch, 'RETRIEVAL_DOCUMENT')))
+    }
+    for (const vector of vectors) {
+      assertVectorWidth(vector, this.dimensions, 'Gemini embedDocuments')
+    }
+    return vectors
+  }
+
+  private async embed(contents: string[], taskType: GeminiTaskType): Promise<number[][]> {
+    const response = await this.ai.models.embedContent({
+      model: this.model,
+      contents,
+      config: { taskType, outputDimensionality: this.dimensions },
+    })
+    return (response.embeddings ?? []).map((embedding) => embedding.values ?? [])
   }
 }
 
 /**
- * Factory: returns the appropriate provider based on config.
- * If OPENAI_API_KEY is set -> OpenAIEmbeddingProvider
- * Otherwise -> MockEmbeddingProvider
+ * Picks the provider once and caches it. `ChunksService` asks for a provider
+ * per document, so without caching every upload would rebuild an API client.
  */
 @Injectable()
 export class EmbeddingProviderFactory {
   private readonly logger = new Logger(EmbeddingProviderFactory.name)
+  private cached: EmbeddingProvider | null = null
+  private cachedKey: string | null = null
 
   constructor(
     private readonly mock: MockEmbeddingProvider,
@@ -83,31 +135,21 @@ export class EmbeddingProviderFactory {
   ) {}
 
   getProvider(): EmbeddingProvider {
-    if (this.config.get<string>('OPENAI_API_KEY')) {
-      this.logger.log('Using OpenAIEmbeddingProvider')
-      return new OpenAIEmbeddingProvider(this.config)
+    const model = this.config.get<string>('GEMINI_EMBEDDING_MODEL') ?? 'gemini-embedding-001'
+    const hasApiKey = Boolean(this.config.get<string>('GEMINI_API_KEY'))
+    const cacheKey = hasApiKey ? `gemini:${model}` : 'mock'
+
+    if (this.cached && this.cachedKey === cacheKey) return this.cached
+
+    if (hasApiKey) {
+      this.cached = new GeminiEmbeddingProvider(this.config)
+    } else {
+      this.logger.log(
+        'Using MockEmbeddingProvider (no GEMINI_API_KEY set) - retrieval is keyword-based, not semantic',
+      )
+      this.cached = this.mock
     }
-    this.logger.log('Using MockEmbeddingProvider (no OPENAI_API_KEY set)')
-    return this.mock
+    this.cachedKey = cacheKey
+    return this.cached
   }
-}
-
-// Backwards-compatible constants (used by legacy code)
-export const EMBEDDING_DIM = 1536
-export const MIN_SIMILARITY = 0.12
-
-/** Cosine similarity between two normalised vectors. */
-export function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length) return 0
-  let dot = 0
-  for (let i = 0; i < a.length; i++) dot += a[i] * b[i]
-  return dot // already normalised
-}
-
-/** Human-readable relevance label for a cosine score. */
-export function similarityLabel(score: number): string {
-  if (score >= 0.8) return 'High'
-  if (score >= 0.6) return 'Medium'
-  if (score >= 0.4) return 'Low'
-  return 'Very low'
 }

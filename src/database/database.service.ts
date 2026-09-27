@@ -1,7 +1,8 @@
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common'
 import bcrypt from 'bcryptjs'
 import mongoose from 'mongoose'
-import { buildChunkSeeds, embedText } from '../documents/embedding.util'
+import { PageText, chunkPages } from '../documents/embedding.util'
+import { EmbeddingProviderFactory } from '../providers/embedding.provider'
 import {
   DocumentChunkEntity,
   DocumentEntity,
@@ -88,6 +89,32 @@ const SEED_DOCUMENTS: DocumentEntity[] = [
     gridFsFileId: null,
   },
 ]
+
+/**
+ * Demo page text for the seeded documents.
+ *
+ * These rows are inserted directly (not uploaded), and they have no PDF in
+ * GridFS, so their text is declared inline instead of being extracted.
+ */
+const SEED_DOCUMENT_PAGES: Record<string, string[]> = {
+  'Employee Handbook.pdf': [
+    'Working hours: the standard working hours are 9:00 AM to 5:00 PM, Monday to Friday. Employees are also allowed a 1-hour lunch break and may request flexible or remote working arrangements through HR.',
+    'Remote work: employees may request flexible or fully remote working arrangements through HR. Approval depends on role and team requirements.',
+    'Annual leave: employees receive 24 days of paid annual leave per year. All leave requests should be submitted at least two weeks in advance.',
+  ],
+  'Leave Policy.pdf': [
+    'Annual leave entitlement: employees are entitled to 24 days of paid annual leave per year according to the leave policy. Leave requests should be submitted through the leave portal at least two weeks in advance.',
+    'Leave carry-over: leave can be carried over subject to policy limits. Special leave and parental leave requests are reviewed by HR on a case-by-case basis.',
+  ],
+  'IT Security Guide.pdf': [
+    'Password requirements: passwords must be at least 12 characters long and include upper/lowercase letters, a number and a symbol. Multi-factor authentication (MFA) is mandatory for all corporate accounts.',
+    'Credential security: never share credentials with anyone. Suspicious login activity must be reported to the IT security team within 24 hours.',
+  ],
+  'Company Overview.pdf': [
+    'Company overview: the company builds AI-powered enterprise knowledge tools that help teams turn internal documents into searchable, answerable knowledge bases.',
+    'Mission: founded with a mission to make organisational knowledge accessible, the company serves enterprise customers across multiple industries.',
+  ],
+}
 
 interface SeedConversation {
   title: string
@@ -176,6 +203,8 @@ const SEED_CONVERSATIONS: SeedConversation[] = [
 export class DatabaseService implements OnApplicationBootstrap {
   private readonly logger = new Logger(DatabaseService.name)
 
+  constructor(private readonly embeddingFactory: EmbeddingProviderFactory) {}
+
   readonly users = UserModel
   readonly documents = DocumentModel
   readonly chunks = DocumentChunkModel
@@ -248,22 +277,31 @@ export class DatabaseService implements OnApplicationBootstrap {
 
     // documents + document_chunks ------------------------------------------
     if ((await this.documents.countDocuments()) === 0) {
+      const provider = this.embeddingFactory.getProvider()
       const docs = await this.documents.insertMany(SEED_DOCUMENTS)
       const chunkDocs: DocumentChunkEntity[] = []
+
       for (const doc of docs) {
-        for (const seed of buildChunkSeeds(doc.fileName)) {
+        const pages: PageText[] = (SEED_DOCUMENT_PAGES[doc.fileName] ?? []).map(
+          (text, index) => ({ pageNumber: index + 1, text }),
+        )
+        const seeds = chunkPages(pages)
+        const vectors = await provider.embedDocuments(seeds.map((seed) => seed.content))
+        seeds.forEach((seed, index) => {
           chunkDocs.push({
             documentId: doc._id.toString(),
             content: seed.content,
             pageNumber: seed.pageNumber,
             chunkIndex: seed.chunkIndex,
-            embedding: embedText(seed.content),
+            embedding: vectors[index],
           })
-        }
+        })
       }
+
       await this.chunks.insertMany(chunkDocs)
       this.logger.log(
-        `Seeded ${docs.length} demo documents + ${chunkDocs.length} chunks`,
+        `Seeded ${docs.length} demo documents + ${chunkDocs.length} chunks ` +
+          `(${provider.name}, ${provider.dimensions}-dim)`,
       )
     }
 

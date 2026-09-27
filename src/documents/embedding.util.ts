@@ -1,16 +1,32 @@
 /**
- * Tiny deterministic "embedding" + chunking helpers.
+ * Pure, dependency-free helpers shared by the indexing and retrieval paths:
+ * chunking, the mock "embedding" model, and vector maths.
  *
- * This is a MOCK embedding model for the MVP: identical text always produces
- * the identical vector, and texts sharing words receive vectors that point in
- * similar directions (so cosine similarity works). In a real RAG app you would
- * replace `embedText` with an embedding API (OpenAI text-embedding-3-small,
- * Cohere embed, ...) and `buildChunkSeeds` with a real PDF text extractor +
- * chunker that also stores page numbers.
+ * The real embedding model lives in `src/providers/embedding.provider.ts`.
+ * `embedText` below is only the offline MOCK used when no GEMINI_API_KEY is
+ * configured - it is a deterministic hashed bag-of-words, NOT semantic.
  */
 
-export const EMBEDDING_DIM = 1536 // mirrors a real embedding model (e.g. OpenAI text-embedding-3-small)
-export const MIN_SIMILARITY = 0.12
+/**
+ * The single source of truth for vector width.
+ *
+ * Both providers must produce exactly this many numbers, because the Atlas
+ * Vector Search index is built with a fixed `numDimensions`. The Gemini
+ * provider passes this value as `outputDimensionality`, and the mock hashes
+ * into this many slots.
+ */
+export const EMBEDDING_DIM = 1536
+
+/** Roughly 250-300 words: big enough for context, small enough to stay focused. */
+export const CHUNK_TARGET_CHARS = 1000
+
+/** Repeated between neighbours so an answer straddling a boundary stays whole. */
+export const CHUNK_OVERLAP_CHARS = 200
+
+export interface PageText {
+  pageNumber: number
+  text: string
+}
 
 export interface ChunkSeed {
   content: string
@@ -63,8 +79,17 @@ export function embedText(text: string): number[] {
   return norm > 0 ? vector.map((value) => value / norm) : vector
 }
 
-/** Cosine similarity between two L2-normalized vectors (0..1). */
+/**
+ * Cosine similarity for two raw (NOT pre-normalized) vectors.
+ *
+ * Returns 0 - never NaN - when the dimensions differ, so a stale vector from
+ * another embedding model degrades to "no match" instead of poisoning every
+ * score in the ranking. Callers can surface the mismatch via a dimension check.
+ */
 export function cosineSimilarity(a: number[], b: number[]): number {
+  if (!Array.isArray(a) || !Array.isArray(b)) return 0
+  if (a.length === 0 || a.length !== b.length) return 0
+
   let dot = 0
   let normA = 0
   let normB = 0
@@ -73,79 +98,86 @@ export function cosineSimilarity(a: number[], b: number[]): number {
     normA += a[i] * a[i]
     normB += b[i] * b[i]
   }
-  const denominator = Math.sqrt(normA) * Math.sqrt(normB) || 1
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB)
+  if (denominator === 0) return 0
   return dot / denominator
 }
 
-/** Nice "98% match" style label from a similarity score (0..1). */
+/** Nice "98% match" style label from a cosine score (-1..1). */
 export function similarityLabel(score: number): string {
+  if (!Number.isFinite(score)) return 'No match'
   const pct = Math.min(99, Math.max(1, Math.round(score * 100)))
   return `${pct}% match`
 }
 
 // ---------------------------------------------------------------------------
-// Chunk content sources. Matching real filenames gives rich, realistic text;
-// any other upload falls back to a small generated summary.
+// Chunking
 // ---------------------------------------------------------------------------
 
-interface ContentPoolEntry {
-  fileName: string
-  pages: string[]
-}
+/**
+ * Splits one oversized run of text into pieces of at most `target` chars,
+ * cutting only after a sentence-ending mark followed by whitespace, so neither
+ * a sentence nor an individual word is ever split across chunks.
+ * Consecutive pieces share `overlap` chars.
+ */
+function splitLongText(text: string, target: number, overlap: number): string[] {
+  const pieces: string[] = []
+  let start = 0
 
-const CONTENT_POOL: ContentPoolEntry[] = [
-  {
-    fileName: 'Employee Handbook.pdf',
-    pages: [
-      'Working hours: the standard working hours are 9:00 AM to 5:00 PM, Monday to Friday. Employees are also allowed a 1-hour lunch break and may request flexible or remote working arrangements through HR.',
-      'Remote work: employees may request flexible or fully remote working arrangements through HR. Approval depends on role and team requirements.',
-      'Annual leave: employees receive 24 days of paid annual leave per year. All leave requests should be submitted at least two weeks in advance.',
-    ],
-  },
-  {
-    fileName: 'Leave Policy.pdf',
-    pages: [
-      'Annual leave entitlement: employees are entitled to 24 days of paid annual leave per year according to the leave policy. Leave requests should be submitted through the leave portal at least two weeks in advance.',
-      'Leave carry-over: leave can be carried over subject to policy limits. Special leave and parental leave requests are reviewed by HR on a case-by-case basis.',
-    ],
-  },
-  {
-    fileName: 'IT Security Guide.pdf',
-    pages: [
-      'Password requirements: passwords must be at least 12 characters long and include upper/lowercase letters, a number and a symbol. Multi-factor authentication (MFA) is mandatory for all corporate accounts.',
-      'Credential security: never share credentials with anyone. Suspicious login activity must be reported to the IT security team within 24 hours.',
-    ],
-  },
-  {
-    fileName: 'Company Overview.pdf',
-    pages: [
-      'Company overview: the company builds AI-powered enterprise knowledge tools that help teams turn internal documents into searchable, answerable knowledge bases.',
-      'Mission: founded with a mission to make organisational knowledge accessible, the company serves enterprise customers across multiple industries.',
-    ],
-  },
-]
+  while (start < text.length) {
+    let end = Math.min(start + target, text.length)
 
-function genericPages(fileName: string): string[] {
-  const base = fileName.replace(/\.pdf$/i, '').replace(/[-_]+/g, ' ')
-  return [
-    `This document (${fileName}) contains information relevant to your knowledge base. The full text has been processed, chunked and indexed for retrieval.`,
-    `Key facts from this document should be checked against the original source. The knowledge assistant references this document when answering related questions. (${base || 'Related material'})`,
-  ]
+    if (end < text.length) {
+      const window = text.slice(start, end)
+      // Sentence boundaries only: ". ", "! " or "? " (period must be followed
+      // by whitespace so version numbers like "2.4" or "1.5" never count).
+      const sentenceEnd = [...window.matchAll(/[.!?]\s+/g)].map((match) =>
+        match.index === undefined ? -1 : match.index + match[0].length,
+      )
+      const boundary = sentenceEnd.length > 0 ? Math.max(...sentenceEnd) : -1
+      // Only honour the boundary if it does not shrink the chunk too much.
+      // Otherwise take the whole window - never fall back to cutting the
+      // middle of a word (a mid-word seam breaks both embedding and lexical
+      // matching for the two halves).
+      if (boundary > target * 0.5) end = start + boundary
+    }
+
+    const piece = text.slice(start, end).trim()
+    if (piece) pieces.push(piece)
+    if (end >= text.length) break
+    // Next window backtracks over the previous tail to preserve context, but
+    // restarts at a word boundary so no chunk ever begins mid-word.
+    let next = Math.max(end - overlap, start + 1)
+    while (next < end && !/\s/.test(text[next - 1])) next++
+    start = next
+  }
+
+  return pieces
 }
 
 /**
- * Produces the one-chunk-per-page seeds for a document. Real filenames that
- * appear in CONTENT_POOL get meaningful pages; everything else gets a small
- * generated summary so uploads are immediately searchable.
+ * Turns extracted page text into the chunks that get embedded and stored.
+ *
+ * Line breaks in a PDF come from *layout* wrapping rather than from sentences,
+ * so each page is first flattened to single-spaced prose and then cut on
+ * sentence boundaries. `pageNumber` is carried through so citations stay
+ * accurate, and `chunkIndex` is sequential across the whole document.
  */
-export function buildChunkSeeds(fileName: string): ChunkSeed[] {
-  const entry = CONTENT_POOL.find(
-    (pool) => pool.fileName.toLowerCase() === fileName.toLowerCase(),
-  )
-  const pages = entry ? entry.pages : genericPages(fileName)
-  return pages.map((content, index) => ({
-    content,
-    pageNumber: index + 1,
-    chunkIndex: index,
-  }))
+export function chunkPages(
+  pages: PageText[],
+  target: number = CHUNK_TARGET_CHARS,
+  overlap: number = CHUNK_OVERLAP_CHARS,
+): ChunkSeed[] {
+  const seeds: ChunkSeed[] = []
+
+  for (const page of pages) {
+    const flat = page.text.replace(/\s+/g, ' ').trim()
+    if (!flat) continue
+
+    for (const piece of splitLongText(flat, target, overlap)) {
+      seeds.push({ content: piece, pageNumber: page.pageNumber, chunkIndex: seeds.length })
+    }
+  }
+
+  return seeds
 }
