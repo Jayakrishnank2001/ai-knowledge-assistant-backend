@@ -88,10 +88,18 @@ Context:\n${contextText}`
   }
 }
 
-/** Factory: picks the right LLM provider based on config. */
+/**
+ * Factory: picks the right LLM provider based on config.
+ *
+ * Providers are cached per cache key (API key presence + model) so callers can
+ * ask for the provider per request - the settings endpoint can hot-swap
+ * GEMINI_CHAT_MODEL and the next request picks up a fresh instance.
+ */
 @Injectable()
 export class LlmProviderFactory {
   private readonly logger = new Logger(LlmProviderFactory.name)
+  private cached: LlmProvider | null = null
+  private cachedKey: string | null = null
 
   constructor(
     private readonly mock: MockLlmProvider,
@@ -99,11 +107,19 @@ export class LlmProviderFactory {
   ) {}
 
   getProvider(): LlmProvider {
-    if (this.config.get<string>('GEMINI_API_KEY')) {
-      this.logger.log('Using GeminiLlmProvider')
-      return new GeminiLlmProvider(this.config)
+    const hasApiKey = Boolean(this.config.get<string>('GEMINI_API_KEY'))
+    const model = this.config.get<string>('GEMINI_CHAT_MODEL') ?? 'gemini-2.5-flash'
+    const cacheKey = hasApiKey ? `gemini:${model}` : 'mock'
+    if (this.cached && this.cachedKey === cacheKey) return this.cached
+
+    if (hasApiKey) {
+      this.logger.log(`Using GeminiLlmProvider (model: ${model})`)
+      this.cached = new GeminiLlmProvider(this.config)
+    } else {
+      this.logger.log('Using MockLlmProvider (no GEMINI_API_KEY set)')
+      this.cached = this.mock
     }
-    this.logger.log('Using MockLlmProvider (no GEMINI_API_KEY set)')
-    return this.mock
+    this.cachedKey = cacheKey
+    return this.cached
   }
 }

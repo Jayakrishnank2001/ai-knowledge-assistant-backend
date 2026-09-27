@@ -36,17 +36,28 @@ export class KnowledgeBaseService implements OnModuleInit {
     )
   }
 
+  /**
+   * Resolve the LLM provider at call time, not from the field frozen during
+   * onModuleInit - the settings endpoint can swap GEMINI_CHAT_MODEL at runtime
+   * and the factory returns a fresh provider for the new cache key.
+   * (Embeddings stay frozen on purpose: they must match the indexed vectors.)
+   */
+  private llm(): LlmProvider {
+    return this.llmFactory.getProvider()
+  }
+
   /** Retrieval scope: the shared knowledge base (userId: null) + the caller's own documents. */
   async ask(
     question: string,
     userId?: string | null,
   ): Promise<{ answer: string; sources: SourceRef[] }> {
+    const llm = this.llm()
     const queryVector = await this.embeddingProvider.embedQuery(question)
     const documentIds = await this.accessibleDocumentIds(userId)
 
     if (documentIds.length === 0) {
       this.logger.warn('No documents are visible to this user - answering without context')
-      return { answer: await this.llmProvider.generateAnswer(question, []), sources: [] }
+      return { answer: await llm.generateAnswer(question, []), sources: [] }
     }
 
     const { ranked, dimensionMismatches } = await this.retrieve(queryVector, documentIds)
@@ -62,7 +73,7 @@ export class KnowledgeBaseService implements OnModuleInit {
       this.logger.warn(
         `No chunk reached the similarity floor (${this.minSimilarity()}) for "${question}"`,
       )
-      return { answer: await this.llmProvider.generateAnswer(question, []), sources: [] }
+      return { answer: await llm.generateAnswer(question, []), sources: [] }
     }
 
     const names = await this.documentNames(ranked)
@@ -73,7 +84,7 @@ export class KnowledgeBaseService implements OnModuleInit {
     )
 
     return {
-      answer: await this.llmProvider.generateAnswer(
+      answer: await llm.generateAnswer(
         question,
         ranked.map((chunk) => ({
           text: chunk.content,

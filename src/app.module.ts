@@ -8,6 +8,7 @@ import { ConversationsModule } from './conversations/conversations.module'
 import { ChatModule } from './chat/chat.module'
 import { OverviewModule } from './overview/overview.module'
 import { ProvidersModule } from './providers/providers.module'
+import { SettingsModule } from './settings/settings.module'
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { ProvidersModule } from './providers/providers.module'
     ChatModule,
     OverviewModule,
     ProvidersModule,
+    SettingsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
