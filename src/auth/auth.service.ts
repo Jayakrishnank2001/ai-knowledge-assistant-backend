@@ -6,13 +6,41 @@ import {
 } from '@nestjs/common'
 import { JwtService } from '@nestjs/jwt'
 import bcrypt from 'bcryptjs'
+import { createHash, randomInt, timingSafeEqual } from 'node:crypto'
 import { DatabaseService } from '../database/database.service'
-import { LoginDto, RegisterDto, UpdateProfileDto } from './dto/auth.dto'
+import { MailService } from './mail.service'
+import {
+  LoginDto,
+  RegisterDto,
+  SignupStartDto,
+  SignupVerifyDto,
+  UpdateProfileDto,
+} from './dto/auth.dto'
 
 const BCRYPT_ROUNDS = 10
 /** bcrypt hashes always start with $2a/$2b/$2y - anything else is a legacy plaintext row. */
 const BCRYPT_PREFIX = '$2'
 const DEFAULT_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000
+/** How long a signup code stays valid. */
+const OTP_TTL_MS = 10 * 60 * 1000
+/** Wrong guesses allowed before the pending signup is thrown away. */
+const MAX_OTP_ATTEMPTS = 5
+
+/** sha256 of the 6-digit code - what gets stored in signup_otps.codeHash. */
+function hashOtp(code: string): string {
+  return createHash('sha256').update(code).digest('hex')
+}
+
+/**
+ * The signup form only asks for email + password, so the required display
+ * name is derived from the email: "john.doe@example.com" -> "John Doe".
+ */
+function nameFromEmail(email: string): string {
+  const local = email.split('@')[0]
+  const words = local.split(/[._\-+]+/).filter(Boolean)
+  if (words.length === 0) return local
+  return words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')
+}
 
 /** Minimal slice of a hydrated mongoose document the auth logic needs. */
 interface StoredUser {
@@ -29,11 +57,22 @@ interface JwtPayload {
   exp?: number
 }
 
+/** A row from `signup_otps` - a signup waiting for its email code. */
+interface PendingSignup {
+  _id: { toString(): string }
+  email: string
+  codeHash: string
+  passwordHash: string
+  expiresAt: Date
+  attempts: number
+}
+
 @Injectable()
 export class AuthService {
   constructor(
     private readonly db: DatabaseService,
     private readonly jwt: JwtService,
+    private readonly mailer: MailService,
   ) {}
 
   async login(dto: LoginDto) {
@@ -143,6 +182,102 @@ export class AuthService {
       // unique index race on email
       if ((error as { code?: number }).code === 11000) {
         throw new ConflictException('That email is already in use')
+      }
+      throw error
+    }
+  }
+
+  /**
+   * Step 1 of the OTP signup.
+   *
+   * Rejects taken emails, then stores a pending signup (fresh code, hashed
+   * password, 10-minute expiry) and emails the code. Calling it again for
+   * the same email just issues a new code, which doubles as "resend".
+   * Returns `devOtp` only when SMTP is unconfigured (local dev fallback).
+   */
+  async startSignup(dto: SignupStartDto) {
+    const email = dto.email.toLowerCase()
+    if (await this.db.users.exists({ email })) {
+      throw new ConflictException('An account with this email already exists')
+    }
+
+    const code = randomInt(0, 1_000_000).toString().padStart(6, '0')
+    const passwordHash = await bcrypt.hash(dto.password, BCRYPT_ROUNDS)
+    const expiresAt = new Date(Date.now() + OTP_TTL_MS)
+
+    try {
+      await this.db.signupOtps.updateOne(
+        { email },
+        { $set: { email, codeHash: hashOtp(code), passwordHash, expiresAt, attempts: 0 } },
+        { upsert: true },
+      )
+    } catch (error) {
+      // two "start" calls racing on the same email hit the unique index
+      if ((error as { code?: number }).code === 11000) {
+        await this.db.signupOtps.updateOne(
+          { email },
+          { $set: { email, codeHash: hashOtp(code), passwordHash, expiresAt, attempts: 0 } },
+        )
+      } else {
+        throw error
+      }
+    }
+
+    const devOtp = await this.mailer.sendSignupOtp({ to: email, code })
+    return devOtp
+      ? { success: true, message: 'Verification code sent', devOtp }
+      : { success: true, message: 'Verification code sent to your email' }
+  }
+
+  /**
+   * Step 2 of the OTP signup: check the emailed code, then create the user
+   * and start a session in one go - a verified signup logs the user in.
+   */
+  async verifySignup(dto: SignupVerifyDto) {
+    const email = dto.email.toLowerCase()
+    const pending = (await this.db.signupOtps.findOne({ email })) as PendingSignup | null
+    if (!pending) {
+      throw new BadRequestException('No signup in progress for this email - request a new code')
+    }
+
+    if (pending.expiresAt.getTime() <= Date.now()) {
+      await this.db.signupOtps.deleteOne({ _id: pending._id })
+      throw new BadRequestException('That code has expired - request a new one')
+    }
+
+    // compare sha256 hashes in constant time
+    const provided = Buffer.from(hashOtp(dto.otp), 'hex')
+    const stored = Buffer.from(pending.codeHash, 'hex')
+    const correct = provided.length === stored.length && timingSafeEqual(provided, stored)
+
+    if (!correct) {
+      const attempts = pending.attempts + 1
+      if (attempts >= MAX_OTP_ATTEMPTS) {
+        await this.db.signupOtps.deleteOne({ _id: pending._id })
+        throw new BadRequestException('Too many incorrect attempts - request a new code')
+      }
+      await this.db.signupOtps.updateOne({ _id: pending._id }, { $set: { attempts } })
+      throw new BadRequestException('Incorrect code')
+    }
+
+    // the code is valid - materialise the account and log the user in
+    if (await this.db.users.exists({ email })) {
+      await this.db.signupOtps.deleteOne({ _id: pending._id })
+      throw new ConflictException('An account with this email already exists')
+    }
+    try {
+      const user = (await this.db.users.create({
+        email,
+        password: pending.passwordHash,
+        name: nameFromEmail(email),
+        workspaceName: 'Acme knowledge base',
+      })) as StoredUser
+      await this.db.signupOtps.deleteOne({ _id: pending._id })
+      return this.createSession(user)
+    } catch (error) {
+      // handle a race with another verify (code 11000)
+      if ((error as { code?: number }).code === 11000) {
+        throw new ConflictException('An account with this email already exists')
       }
       throw error
     }

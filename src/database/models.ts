@@ -57,6 +57,22 @@ export interface UserEntity {
   workspaceName?: string
 }
 
+/**
+ * A signup waiting for its email OTP to be confirmed.
+ *
+ * The user record itself is only inserted into `users` after the code is
+ * verified, so this row carries everything needed to finish the signup:
+ * the emailed code (stored as a sha256 hash) and the already-bcrypt-hashed
+ * password. The TTL index deletes abandoned signups automatically.
+ */
+export interface SignupOtpEntity {
+  email: string
+  codeHash: string
+  passwordHash: string
+  expiresAt: Date
+  attempts: number
+}
+
 /** A logout-invalidated JWT. A TTL index prunes rows once the token expires. */
 export interface RevokedTokenEntity {
   token: string
@@ -164,6 +180,20 @@ const revokedTokenSchema = new Schema(
 // MongoDB deletes the row automatically once the JWT itself has expired
 revokedTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 })
 
+const signupOtpSchema = new Schema(
+  {
+    // one pending signup per email - starting again replaces the old code
+    email: { type: String, required: true, unique: true, lowercase: true },
+    codeHash: { type: String, required: true },
+    passwordHash: { type: String, required: true },
+    expiresAt: { type: Date, required: true },
+    attempts: { type: Number, required: true, default: 0 },
+  },
+  { collection: 'signup_otps' },
+)
+// MongoDB deletes abandoned signups once their code has expired
+signupOtpSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 })
+
 // ---------------------------------------------------------------------------
 // Models — the typed handles used to query each collection
 // ---------------------------------------------------------------------------
@@ -183,4 +213,9 @@ export const MessageModel: Model<MessageEntity> = mongoose.model<MessageEntity>(
 export const RevokedTokenModel: Model<RevokedTokenEntity> = mongoose.model<RevokedTokenEntity>(
   'RevokedToken',
   revokedTokenSchema,
+)
+
+export const SignupOtpModel: Model<SignupOtpEntity> = mongoose.model<SignupOtpEntity>(
+  'SignupOtp',
+  signupOtpSchema,
 )

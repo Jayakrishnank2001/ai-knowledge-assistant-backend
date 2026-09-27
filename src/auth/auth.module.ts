@@ -3,6 +3,7 @@ import { JwtModule, JwtModuleOptions } from '@nestjs/jwt'
 import { AuthController } from './auth.controller'
 import { AuthService } from './auth.service'
 import { AuthGuard } from './auth.guard'
+import { MailService } from './mail.service'
 
 // secret/sign options come from .env (loaded in main.ts before bootstrap)
 const signOptions: JwtModuleOptions['signOptions'] = {
@@ -15,7 +16,7 @@ const signOptions: JwtModuleOptions['signOptions'] = {
 @Module({
   imports: [JwtModule.register({ secret: process.env.JWT_SECRET, signOptions })],
   controllers: [AuthController],
-  providers: [AuthService, AuthGuard],
+  providers: [AuthService, AuthGuard, MailService],
   // exported so guard-protected modules can resolve AuthGuard + its dependency
   exports: [AuthService, AuthGuard],
 })

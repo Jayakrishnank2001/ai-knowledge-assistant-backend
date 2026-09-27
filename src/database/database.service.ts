@@ -15,6 +15,7 @@ import {
   DocumentModel,
   MessageModel,
   RevokedTokenModel,
+  SignupOtpModel,
   UserModel,
 } from './models'
 
@@ -211,6 +212,7 @@ export class DatabaseService implements OnApplicationBootstrap {
   readonly conversations = ConversationModel
   readonly messages = MessageModel
   readonly revokedTokens = RevokedTokenModel
+  readonly signupOtps = SignupOtpModel
 
   /** Called automatically once the app has finished bootstrapping. */
   async onApplicationBootstrap(): Promise<void> {
