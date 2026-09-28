@@ -40,7 +40,7 @@ interface StoredDocument {
   status: DocumentStatus
   uploadedAt: Date
   pageCount: number
-  gridFsFileId?: { toString(): string } | null
+  gridFsFileId?: string | null
 }
 
 function formatBytes(bytes: number): string {
