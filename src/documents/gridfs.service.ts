@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common'
 import mongoose from 'mongoose'
 import { GridFSBucket, ObjectId } from 'mongodb'
+import { Readable } from 'stream'
 
 /**
  * Thin wrapper around MongoDB GridFS.
@@ -49,6 +50,16 @@ export class GridFsService {
       stream.once('error', reject)
       stream.once('end', () => resolve(Buffer.concat(parts)))
     })
+  }
+
+  /**
+   * Open a GridFS file as a readable stream instead of loading it into memory.
+   * Used by the file-preview endpoint so a 25 MB PDF is piped straight to the
+   * HTTP response.
+   */
+  createDownloadStream(fileId: ObjectId | string): Readable {
+    const bucket = this.bucket()
+    return bucket.openDownloadStream(new ObjectId(fileId.toString()))
   }
 
   /** Delete a GridFS file (and its chunks) by fs.files._id. */

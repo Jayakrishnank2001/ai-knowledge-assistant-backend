@@ -8,6 +8,8 @@ import { DatabaseService, DocumentStatus } from '../database/database.service'
 import { ChunksService } from './chunks.service'
 import { GridFsService } from './gridfs.service'
 import { PdfTextService } from './pdf-text.service'
+import { ObjectId } from 'mongodb'
+import { Readable } from 'stream'
 
 const MB = 1024 * 1024
 
@@ -19,6 +21,14 @@ export interface DocumentDto {
   status: DocumentStatus
   uploadedAt: string
   pageCount: number
+}
+
+/** A GridFS binary plus the metadata needed to serve it over HTTP. */
+export interface DocumentFile {
+  fileName: string
+  mimeType: string
+  size: number
+  stream: Readable
 }
 
 /** Shape of a row returned by MongoDB (entity + the generated ids). */
@@ -70,14 +80,46 @@ export class DocumentsService {
   }
 
   async get(id: string, userId: string): Promise<DocumentDto> {
-    const doc = await this.db.documents.findOne({
-      _id: id,
-      $or: [{ userId: null }, { userId }],
-    })
+    const doc = await this.loadDocument(id, userId)
     if (!doc) {
       throw new NotFoundException(`Document "${id}" not found`)
     }
     return toDto(doc)
+  }
+
+  /**
+   * Loads a document the caller may read: global rows (`userId: null`) plus the
+   * caller's own. A malformed id is reported as "not found" rather than letting
+   * Mongoose throw a CastError that would surface as a 500.
+   */
+  private async loadDocument(id: string, userId: string): Promise<StoredDocument | null> {
+    if (!ObjectId.isValid(id)) return null
+    return this.db.documents.findOne({
+      _id: id,
+      $or: [{ userId: null }, { userId }],
+    })
+  }
+
+  /**
+   * Opens the original PDF from GridFS so the API can stream it back for the
+   * in-app preview (and for downloads). Visibility follows the same rule as
+   * `get`: a document is readable when it is global (userId null) or owned by
+   * the caller, so one user can never preview another user's file.
+   */
+  async openFile(id: string, userId: string): Promise<DocumentFile> {
+    const doc = await this.loadDocument(id, userId)
+    if (!doc) {
+      throw new NotFoundException(`Document "${id}" not found`)
+    }
+    if (!doc.gridFsFileId) {
+      throw new NotFoundException(`Document "${id}" has no stored file to preview`)
+    }
+    return {
+      fileName: doc.fileName,
+      mimeType: doc.mimeType || 'application/pdf',
+      size: doc.fileSizeBytes,
+      stream: this.gridFs.createDownloadStream(doc.gridFsFileId),
+    }
   }
 
   /**
