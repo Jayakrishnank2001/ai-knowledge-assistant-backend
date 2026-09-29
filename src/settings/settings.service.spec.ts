@@ -62,10 +62,10 @@ describe('SettingsService', () => {
     it('appends the key when it is missing from .env', async () => {
       await fs.writeFile(envFile, 'PORT=3001', 'utf8')
 
-      await service.setChatModel('gemini-2.5-flash')
+      await service.setChatModel('gemini-3.5-flash-lite')
 
       const written = await fs.readFile(envFile, 'utf8')
-      expect(written).toBe('PORT=3001\nGEMINI_CHAT_MODEL=gemini-2.5-flash\n')
+      expect(written).toBe('PORT=3001\nGEMINI_CHAT_MODEL=gemini-3.5-flash-lite\n')
     })
 
     it('creates .env when the file does not exist', async () => {

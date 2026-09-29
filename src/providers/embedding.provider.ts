@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import { GoogleGenAI } from '@google/genai'
 import { EMBEDDING_DIM, embedText } from '../documents/embedding.util'
+import { toFriendlyGeminiError, withGeminiRetry } from './gemini-retry.util'
 
 /** Gemini task types: queries and documents are embedded asymmetrically. */
 type GeminiTaskType = 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT'
@@ -110,12 +111,21 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
   }
 
   private async embed(contents: string[], taskType: GeminiTaskType): Promise<number[][]> {
-    const response = await this.ai.models.embedContent({
-      model: this.model,
-      contents,
-      config: { taskType, outputDimensionality: this.dimensions },
-    })
-    return (response.embeddings ?? []).map((embedding) => embedding.values ?? [])
+    try {
+      const response = await withGeminiRetry(
+        () =>
+          this.ai.models.embedContent({
+            model: this.model,
+            contents,
+            config: { taskType, outputDimensionality: this.dimensions },
+          }),
+        { operation: `Gemini embeddings (${this.model})` },
+        this.logger,
+      )
+      return (response.embeddings ?? []).map((embedding) => embedding.values ?? [])
+    } catch (error) {
+      toFriendlyGeminiError(error, `Gemini embeddings (${this.model})`)
+    }
   }
 }
 

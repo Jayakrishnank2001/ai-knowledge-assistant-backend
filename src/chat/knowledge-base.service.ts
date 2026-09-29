@@ -8,6 +8,15 @@ import { EmbeddingProvider, EmbeddingProviderFactory } from '../providers/embedd
 import { LlmProvider, LlmProviderFactory } from '../providers/llm.provider'
 import { RawChunk, ScoredChunk, rankChunks } from './retrieval.util'
 
+/** One Sources-card entry: merged text of every retrieved chunk from a document page. */
+interface SourceGroup {
+  documentName: string;
+  pageNumber: number;
+  /** Best chunk score in the group, used for the relevance label. */
+  score: number;
+  chunks: ScoredChunk[];
+}
+
 /** How many nearest neighbours Atlas returns before we re-rank them exactly. */
 const VECTOR_SEARCH_CANDIDATES = 100
 
@@ -83,26 +92,64 @@ export class KnowledgeBaseService implements OnModuleInit {
       `Retrieved ${ranked.length} chunk(s) for "${question}" (top score ${ranked[0].score.toFixed(3)})`,
     )
 
+    const groups = this.groupSources(ranked, nameOf);
+    const context = groups.map((group) => ({
+      text: group.chunks.map((c) => c.content).join('\n\n'),
+      documentName: group.documentName,
+      page: group.pageNumber,
+    }));
+
+    const llmAnswer = await llm.generateAnswer(question, context);
     return {
-      answer: await llm.generateAnswer(
-        question,
-        ranked.map((chunk) => ({
-          text: chunk.content,
-          documentName: nameOf(chunk),
-          page: chunk.pageNumber,
-        })),
-      ),
-      sources: ranked.map((chunk) => ({
-        name: nameOf(chunk),
-        page: chunk.pageNumber,
-        relevance: similarityLabel(chunk.score),
-      })),
+      answer: llmAnswer,
+      sources: this.citedSources(llmAnswer, groups),
     }
   }
 
   // -------------------------------------------------------------------------
   // Retrieval
   // -------------------------------------------------------------------------
+
+  /**
+   * Keep the sources card honest: only chunks whose [Source N] tag the model
+   * actually wrote in its answer stay visible. Falls back to the top chunk
+   * when the model cited nothing, so the card is never empty.
+   */
+  private groupSources(ranked: ScoredChunk[], nameOf: (chunk: ScoredChunk) => string): SourceGroup[] {
+    const groups: SourceGroup[] = [];
+    const indexByKey = new Map();
+    for (const chunk of ranked) {
+      const documentName = nameOf(chunk);
+      const key = documentName + '|' + chunk.pageNumber;
+      let group = indexByKey.get(key);
+      if (!group) {
+        group = { documentName, pageNumber: chunk.pageNumber, score: chunk.score, chunks: [] };
+        indexByKey.set(key, groups.length);
+        groups.push(group);
+      } else {
+        group = groups[indexByKey.get(key)];
+        group.score = Math.max(group.score, chunk.score);
+      }
+      group.chunks.push(chunk);
+    }
+    return groups;
+  }
+
+  private citedSources(answer: string, groups: SourceGroup[]): SourceRef[] {
+    const cited = new Set<number>();
+    const pattern = /\[Source\s+(\d+)\]/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(answer)) !== null) {
+      const index = Number(match[1]) - 1;
+      if (Number.isInteger(index) && index >= 0 && index < groups.length) cited.add(index);
+    }
+    const visible = (cited.size > 0 ? [...cited] : [0]).sort((a, b) => a - b);
+    return visible.map((index) => ({
+      name: groups[index].documentName,
+      page: groups[index].pageNumber,
+      relevance: similarityLabel(groups[index].score),
+    }));
+  }
 
   private async accessibleDocumentIds(userId?: string | null): Promise<string[]> {
     const scope: mongoose.FilterQuery<DocumentEntity> = userId
@@ -123,6 +170,7 @@ export class KnowledgeBaseService implements OnModuleInit {
       minSimilarity: this.minSimilarity(),
       topK: this.numberFromConfig('RAG_TOP_K', 6),
       maxPerDocument: this.numberFromConfig('RAG_MAX_CHUNKS_PER_DOCUMENT', 3),
+      relevanceMargin: this.numberFromConfig('RAG_RELEVANCE_MARGIN', 0.04),
     }
 
     if (this.vectorIndex.isReady()) {

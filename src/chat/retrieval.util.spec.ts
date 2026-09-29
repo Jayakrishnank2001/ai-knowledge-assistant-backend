@@ -83,6 +83,29 @@ describe('rankChunks', () => {
     expect(ranked.map((entry) => entry.chunkId)).not.toContain('stale')
   })
 
+  it('trims chunks that fall too far below the best match', () => {
+    const { ranked } = rankChunks(QUERY, CANDIDATES, {
+      minSimilarity: 0,
+      topK: 10,
+      maxPerDocument: 10,
+      relevanceMargin: 0.2,
+    })
+
+    // a1 (1.0) and a2 (0.8) survive; b1 (0.6) is >0.2 below the best.
+    expect(ranked.map((entry) => entry.chunkId)).toEqual(['a1', 'a2'])
+  })
+
+  it('keeps close contenders inside the relevance margin', () => {
+    const { ranked } = rankChunks(QUERY, CANDIDATES, {
+      minSimilarity: 0,
+      topK: 10,
+      maxPerDocument: 10,
+      relevanceMargin: 0.5,
+    })
+
+    expect(ranked.map((entry) => entry.chunkId)).toEqual(['a1', 'a2', 'b1', 'a3'])
+  })
+
   it('returns nothing when there are no candidates', () => {
     const { ranked, dimensionMismatches } = rankChunks(QUERY, [], {
       minSimilarity: 0,

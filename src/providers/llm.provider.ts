@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import { GoogleGenAI } from '@google/genai'
+import { toFriendlyGeminiError, withGeminiRetry } from './gemini-retry.util'
 
 /** Normalised LLM interface - all providers must implement this. */
 export interface LlmProvider {
@@ -65,26 +66,37 @@ export class GeminiLlmProvider implements LlmProvider {
     const systemPrompt = `You are a helpful assistant that answers questions based ONLY on the provided context.
 
 Rules:
-- If the context does not contain the answer, say so honestly.
-- Cite sources using [Source N] notation inline.
+- Answer ONLY from the context. If it is absent, say so honestly.
+- Cite ONLY the source(s) that directly contain the answer, using [Source N] inline.
+- Do NOT cite a source merely because it shares a keyword or topic; omit irrelevant sources entirely.
+- If a single source fully answers the question, cite only that source - do not pad the answer with additional sources.
 - Be concise and direct.
 
 Context:\n${contextText}`
 
-    const response = await this.ai.models.generateContent({
-      model: this.model,
-      contents: `Context:\n${contextText || '(no matching documents were found)'}\n\nQuestion: ${question}`,
-      config: {
-        systemInstruction: systemPrompt,
-        temperature: 0.1,
-        // Thinking models (e.g. gemini-3.x-flash) spend part of this budget on
-        // reasoning tokens, so keep it well above the expected answer length -
-        // too small and `response.text` comes back empty.
-        maxOutputTokens: 4096,
-      },
-    })
+    try {
+      const response = await withGeminiRetry(
+        () =>
+          this.ai.models.generateContent({
+            model: this.model,
+            contents: `Context:\n${contextText || '(no matching documents were found)'}\n\nQuestion: ${question}`,
+            config: {
+              systemInstruction: systemPrompt,
+              temperature: 0.1,
+              // Thinking models (e.g. gemini-3.x-flash) spend part of this budget on
+              // reasoning tokens, so keep it well above the expected answer length -
+              // too small and `response.text` comes back empty.
+              maxOutputTokens: 4096,
+            },
+          }),
+        { operation: `Gemini chat (${this.model})` },
+        this.logger,
+      )
 
-    return response.text?.trim() || 'No answer generated.'
+      return response.text?.trim() || 'No answer generated.'
+    } catch (error) {
+      toFriendlyGeminiError(error, `Gemini chat (${this.model})`)
+    }
   }
 }
 

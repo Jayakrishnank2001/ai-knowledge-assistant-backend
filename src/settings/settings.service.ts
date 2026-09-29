@@ -9,12 +9,16 @@ import path from 'node:path'
  */
 export const AVAILABLE_CHAT_MODELS = [
   'gemini-3.8-flash',
+  'gemini-3.7-flash',
   'gemini-3.6-flash',
-  'gemini-2.5-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-3-flash-preview',
 ] as const
 
 /** Fallback when GEMINI_CHAT_MODEL is absent from .env and process.env. */
-export const DEFAULT_CHAT_MODEL = 'gemini-2.5-flash'
+export const DEFAULT_CHAT_MODEL = 'gemini-3.5-flash-lite'
 
 const ENV_KEY = 'GEMINI_CHAT_MODEL'
 

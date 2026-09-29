@@ -25,6 +25,12 @@ export interface RankOptions {
   topK: number
   /** Maximum chunks taken from any single document, to keep sources diverse. */
   maxPerDocument: number
+  /**
+   * Drop chunks scoring more than this far below the best chunk.
+   * Trims boilerplate/keyword matches (e.g. 0.55) when a clearly better
+   * chunk (e.g. 0.65) exists, while keeping genuinely close contenders.
+   */
+  relevanceMargin?: number
 }
 
 export interface RankResult {
@@ -73,6 +79,13 @@ export function rankChunks(
   for (const chunk of scored) {
     // `scored` is sorted, so once we drop below the floor nothing else qualifies.
     if (chunk.score < options.minSimilarity) break
+    // Sorted, so once a chunk falls too far behind the best, the rest are worse.
+    if (
+      options.relevanceMargin !== undefined &&
+      ranked.length > 0 &&
+      chunk.score < ranked[0].score - options.relevanceMargin
+    )
+      break
 
     const used = perDocument.get(chunk.documentId) ?? 0
     if (used >= options.maxPerDocument) continue
