@@ -6,6 +6,10 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 > **Status:** working RAG pipeline backed by **MongoDB Atlas** (+ Atlas Vector
 > Search), **Gemini embeddings** (`gemini-embedding-001`) and a **Gemini chat
 > model** — with an offline mock fallback when no `GEMINI_API_KEY` is set.
+> Signup uses **email + password with a 6-digit OTP** delivered over SMTP.
+>
+> The UI lives in [`../ai-knowledge-assistant-frontend`](../ai-knowledge-assistant-frontend)
+> (see its README for setup).
 
 ## Tech stack
 
@@ -20,6 +24,8 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 | Embeddings         | Gemini gemini-embedding-001 (1536-dim), offline mock fallback |
 | Chat answers       | Gemini chat model (see GEMINI_CHAT_MODEL) |
 | Vector search      | Atlas Vector Search ($vectorSearch) + in-process cosine fallback |
+| Auth               | Email+password (bcrypt) + 6-digit email OTP, JWT sessions |
+| Email              | nodemailer over SMTP (dev fallback: code logged to console) |
 | Validation         | class-validator + ValidationPipe    |
 
 ## Getting started
@@ -27,8 +33,9 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 ```bash
 npm install
 
-# 1. Put your MongoDB connection string in .env
-cp .env.example .env          # then edit .env -> set MONGODB_URI + GEMINI_API_KEY
+# 1. Configure .env (MongoDB + Gemini are required; SMTP is optional but
+#    recommended so signup codes are emailed instead of printed to the console)
+cp .env.example .env
 
 npm run start:dev             # watch mode on http://localhost:3001
 # or
@@ -62,6 +69,19 @@ lives inside `OneDrive/Documents`, and OneDrive can mark committed files as
 a fresh local copy of the file (delete + restore it, or copy to a new name and
 back). Pinning the folder locally in OneDrive avoids the issue entirely.
 
+**Gemini `429 RESOURCE_EXHAUSTED` / `503 UNAVAILABLE` "high demand"**: Google
+rate-limits embedding and chat calls per key, and popular models get
+capacity-saturated. The providers automatically retry transient 429/500/503
+with exponential backoff (4 attempts) before surfacing a friendly 503. If it
+persists: wait a minute, check your quota in Google AI Studio, or switch to a
+higher-capacity model under **Settings → AI Preferences** (`gemini-3.x-flash-lite`
+variants are the most available).
+
+**Gemini `404 NOT_FOUND` "no longer available"**: API keys created after the
+3.x launch can only use `gemini-3.x` models — `1.5/2.0/2.5` ids return 404.
+The Settings → AI Preferences allowlist only contains models Google still
+serves, so pick one from there.
+
 Set a different port with the `PORT` environment variable (see `.env.example`).
 
 ### Environment variables
@@ -73,17 +93,21 @@ Set a different port with the `PORT` environment variable (see `.env.example`).
 | `MONGODB_DBNAME`  | Database name inside the cluster (default `ai-knowledge-assistant`) | `ai-knowledge-assistant` |
 | `GEMINI_API_KEY`  | Google Gemini key (enables real embeddings + answers)    | `AIza...` |
 | `GEMINI_EMBEDDING_MODEL` | Embedding model - keep 1536-dim output, then `npm run reindex` | `gemini-embedding-001` |
-| `GEMINI_CHAT_MODEL` | Chat model for answers                                    | `gemini-2.5-flash` |
+| `GEMINI_CHAT_MODEL` | Chat model for answers (also editable in Settings → AI Preferences) | `gemini-3.5-flash-lite` |
 | `RAG_MIN_SIMILARITY` | Cosine floor for retrieval (default: 0.12 mock / 0.5 Gemini) | `0.5` |
 | `RAG_TOP_K`       | Max chunks handed to the LLM (default `6`)                | `6` |
 | `RAG_MAX_CHUNKS_PER_DOCUMENT` | Max chunks per document (default `3`)        | `3` |
+| `RAG_RELEVANCE_MARGIN` | Drop chunks scoring more than this below the best match (default `0.04`) | `0.04` |
+| `JWT_EXPIRES_IN`  | Access-token lifetime                                      | `7d`   |
+| `CORS_ORIGINS`    | Comma-separated browser origins allowed by CORS (omit → any origin) | `http://localhost:3000,https://ai-knowledge-assistant-liart-theta.vercel.app` |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | SMTP account for signup OTP emails (omit → dev fallback) | `smtp.gmail.com` |
 
 > ⚠️ The real connection string lives in `.env` (gitignored). `.env.example` only
 > contains placeholders — never commit real credentials.
 
 ## How persistence works
 
-The data follows a logical RAG-ready layout. MongoDB ends up with **five
+The data follows a logical RAG-ready layout. MongoDB ends up with **seven
 application collections** (managed by the code) plus the **GridFS collections**
 (maintained automatically by MongoDB — never create or edit them manually):
 
@@ -97,6 +121,8 @@ MongoDB Atlas (db: ai-knowledge-assistant)
 │                            RAG retrieval searches
 ├── conversations         ← chat thread metadata (title, preview, date)
 ├── messages              ← one row per chat message (conversationId -> conversation)
+├── pending_signups       ← unverified OTP signups (hashed code, TTL auto-purge)
+├── revoked_tokens        ← logout-revoked JWTs (TTL auto-purge)
 │
 ├── fs.files              ← GridFS (auto) - PDF file metadata
 └── fs.chunks             ← GridFS (auto) - the PDF binary in 255 KB chunks
@@ -134,8 +160,11 @@ POST /api/chat { question }
        drop mismatched vector widths (stale models), drop below
        RAG_MIN_SIMILARITY, cap RAG_MAX_CHUNKS_PER_DOCUMENT per document,
        keep top RAG_TOP_K overall
-  4. Gemini answers from the surviving chunks; sources = { document, page, relevance }
-  5. user + assistant rows → messages, conversation preview/date updated
+  4. retrieved chunks are grouped by document + page (one Sources card per
+     page, so [Source N] citations map 1:1 to what the user sees) and only
+     the groups the model actually cited stay visible
+  5. Gemini answers from the surviving groups; sources = { document, page, relevance }
+  6. user + assistant rows → messages, conversation preview/date updated
 ```
 
 > The embedding model is picked once at startup: `GEMINI_API_KEY` set →
@@ -171,19 +200,23 @@ curl.exe -H "Authorization: Bearer $TOKEN" \
 src/
 ├── main.ts                     # bootstrap: MongoDB connect, CORS, /api prefix, validation
 ├── app.module.ts               # root module wiring all feature modules
+├── common/                     # shared @CurrentUser decorator + request types
 ├── database/                   # @Global Mongoose-backed data layer + seeding
-│   ├── models.ts               # schemas + typed models (users, documents,
-│   │                           #   document_chunks, conversations, messages,
-│   │                           #   revoked_tokens)
+│   ├── models.ts               # schemas + typed models (users, documents, document_chunks,
+│   │                           #   conversations, messages, pending_signups, revoked_tokens)
 │   └── database.service.ts     # repository facade (db.users / .documents / ...)
-├── documents/                  # list / get / upload / delete
-│   ├── gridfs.service.ts       # GridFS upload/delete wrapper
-│   ├── chunks.service.ts       # chunk generation + cascading cleanup
-│   ├── embedding.util.ts       # mock embedText/cosine similarity/chunk builder
-├── auth/                       # JWT login/register/me/logout + AuthGuard + bcrypt
+├── documents/                  # upload pipeline: extract, chunk + embed, serve files
+│   ├── gridfs.service.ts       # GridFS upload/download/delete wrapper
+│   ├── chunks.service.ts       # chunk embedding + cascading cleanup
+│   ├── embedding.util.ts       # sentence-boundary chunker + mock embedder + cosine
+│   └── pdf-text.service.ts     # per-page text extraction (pdf-parse v2)
+├── auth/                       # OTP signup (mail.service), login/register/me/logout, AuthGuard
+├── providers/                  # Gemini embedding/LLM factories + retry-with-backoff helper
+├── settings/                   # AI-preferences API (chat model persisted to .env)
 ├── conversations/              # conversations + messages split into their own models
-├── chat/                       # RAG retrieval over document_chunks (KnowledgeBaseService)
-└── overview/                   # dashboard stats + recent documents
+├── chat/                       # RAG retrieval (KnowledgeBaseService) + rankChunks util
+├── overview/                   # per-user dashboard stats + recent documents
+└── scripts/reindex.ts          # re-extract + re-embed everything (npm run reindex)
 ```
 
 Each feature follows the NestJS layer pattern:
@@ -201,13 +234,15 @@ Base URL: `http://localhost:3001/api`
 
 ### Auth (demo account: `demo@nexa.ai` / `password123`)
 
-| Method | Route                | Body                                | Description                       |
-| ------ | -------------------- | ----------------------------------- | --------------------------------- |
-| POST   | `/auth/login`        | `{ email, password }`               | Returns `{ token, user }` (JWT)   |
-| POST   | `/auth/register`     | `{ name, email, password }`         | Creates an account, returns JWT   |
-| GET    | `/auth/me`           | _Bearer token_                      | Current logged-in user            |
-| PATCH  | `/auth/me`           | `{ name?, email?, workspaceName? }` | Update profile (guarded)          |
-| POST   | `/auth/logout`       | _Bearer token_                      | Revokes the token                 |
+| Method | Route                | Body                                | Description                                      |
+| ------ | -------------------- | ----------------------------------- | ------------------------------------------------ |
+| POST   | `/auth/signup/start` | `{ email, password }`               | Sends a 6-digit OTP to the email (10-min expiry) |
+| POST   | `/auth/signup/verify`| `{ email, otp }`                    | Verifies the code → creates the user + JWT       |
+| POST   | `/auth/login`        | `{ email, password }`               | Returns `{ token, user }` (JWT)                  |
+| POST   | `/auth/register`     | `{ name, email, password }`         | Creates an account without OTP (API/demo use)    |
+| GET    | `/auth/me`           | _Bearer token_                      | Current logged-in user                           |
+| PATCH  | `/auth/me`           | `{ name?, email?, workspaceName? }` | Update profile (guarded)                         |
+| POST   | `/auth/logout`       | _Bearer token_                      | Revokes the token (server-side deny-list)        |
 
 **Sessions:** signed **JWTs** (7-day expiry, `JWT_SECRET` in `.env`). Passwords are
 hashed with **bcrypt** on register/seed; legacy plaintext rows are upgraded to a
@@ -218,17 +253,19 @@ expires.
 
 ### Documents
 
-| Method | Route          | Body / file                         | Description                    |
-| ------ | -------------- | ----------------------------------- | ------------------------------ |
-| GET    | `/documents`   | —                                   | List all uploaded documents    |
-| GET    | `/documents/:id` | —                                 | One document                   |
-| POST   | `/documents`   | `multipart/form-data` field `file`  | Upload a PDF (max 25 MB)       |
-| DELETE | `/documents/:id` | —                                 | Delete a document              |
+| Method | Route          | Body / file                         | Description                                |
+| ------ | -------------- | ----------------------------------- | ------------------------------------------ |
+| GET    | `/documents`   | —                                   | List documents (shared KB + own)           |
+| GET    | `/documents/:id` | —                                 | One document                               |
+| GET    | `/documents/:id/file` | —                             | Stream the original PDF (preview/download) |
+| POST   | `/documents`   | `multipart/form-data` field `file`  | Upload a PDF (max 25 MB)                   |
+| DELETE | `/documents/:id` | —                                 | Delete a document (owner only)             |
 
-Upload example:
+Upload example (every route below `/api` except `/health` needs the JWT):
 
 ```bash
 curl.exe -X POST http://localhost:3001/api/documents \
+  -H "Authorization: Bearer $TOKEN" \
   -F "file=@C:\path\to\Employee Handbook.pdf"
 ```
 
@@ -255,14 +292,22 @@ curl.exe -X POST http://localhost:3001/api/documents \
 | GET    | `/overview/stats`         | Document/page/conversation counts        |
 | GET    | `/overview/recent-documents` | Recently uploaded documents             |
 
+### Settings (AI preferences)
+
+| Method | Route          | Body             | Description                                                                     |
+| ------ | -------------- | ---------------- | ------------------------------------------------------------------------------- |
+| GET    | `/settings/ai` | —                | Current chat model + the allowlisted choices                                    |
+| PUT    | `/settings/ai` | `{ chatModel }`  | Validate against the allowlist → rewrite `GEMINI_CHAT_MODEL` in `.env` → applies immediately (no restart) |
+
 ## Example flows
 
 **1. Ask a question (frontend `ChatPage`)**
 
 ```bash
 curl.exe -X POST http://localhost:3001/api/chat \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{\"question\":\"How many days of annual leave do employees get?\"}'
+  -d '{"question":"How many days of annual leave do employees get?"}'
 ```
 
 Response contains the conversation with a user message + an assistant message
@@ -271,15 +316,31 @@ carrying `sources` (document name, page, relevance).
 **2. Upload a document (frontend `DocumentsPage`)**
 
 ```bash
-curl.exe -X POST http://localhost:3001/api/documents -F "file=@leave.pdf"
+curl.exe -X POST http://localhost:3001/api/documents \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@leave.pdf"
 ```
 
 The document is created with `status: "processing"` and flips to `"completed"`
-after ~2.5 seconds.
+once extraction + embedding finish in the background (a few seconds; failures
+land on `status: "failed"` with a logged reason).
+
+**3. Sign up with an email OTP (frontend `LoginPage`)**
+
+```bash
+curl.exe -X POST http://localhost:3001/api/auth/signup/start \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"s3cret-pass"}'
+# → 6-digit code emailed (printed to the backend console if SMTP is unconfigured)
+
+curl.exe -X POST http://localhost:3001/api/auth/signup/verify \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","otp":"123456"}'
+# → { token, user } - the account now exists in `users`
+```
 
 ## What's next
 
-- Replace the mock `KnowledgeBaseService` with real RAG: PDF text extraction,
-  embeddings + vector search, and an LLM call.
-- Replace the in-memory session tokens with JWT + refresh tokens.
-- Add e2e tests (`supertest`) and a `/test` folder.
+- OCR for scanned/image-only PDFs (they currently land on `status: "failed"`).
+- Refresh tokens / shorter JWT lifetimes.
+- e2e tests (`supertest`) covering the OTP signup + RAG flows.

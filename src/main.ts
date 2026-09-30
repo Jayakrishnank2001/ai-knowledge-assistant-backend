@@ -92,8 +92,14 @@ async function bootstrap() {
   // Every route will live under /api, e.g. POST /api/auth/login
   app.setGlobalPrefix('api')
 
-  // Allow the Next.js frontend (http://localhost:3000) to call this API
-  app.enableCors({ origin: true, credentials: true })
+  // Allow the configured frontends: comma-separated CORS_ORIGINS in .env
+  // (e.g. http://localhost:3000 + the Vercel deployment). Omit the variable to
+  // reflect any origin, which keeps ad-hoc local tooling (curl, Swagger) easy.
+  const corsOrigins = (process.env.CORS_ORIGINS ?? '')
+    .split(',')
+    .map((origin) => origin.trim().replace(/\/+$/, ''))
+    .filter(Boolean)
+  app.enableCors({ origin: corsOrigins.length ? corsOrigins : true, credentials: true })
 
   // Validate & strip incoming request bodies defined with class-validator DTOs
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
