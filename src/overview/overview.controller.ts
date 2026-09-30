@@ -1,11 +1,7 @@
-import { Controller, Get, Req, UseGuards } from '@nestjs/common'
-import { Request } from 'express'
+import { Controller, Get, UseGuards } from '@nestjs/common'
 import { AuthGuard } from '../auth/auth.guard'
+import { CurrentUser, AuthUserPayload } from '../common/authenticated-request'
 import { OverviewService } from './overview.service'
-
-interface AuthenticatedRequest extends Request {
-  user: { id: string; email: string; name: string }
-}
 
 @UseGuards(AuthGuard)
 @Controller('overview')
@@ -14,13 +10,13 @@ export class OverviewController {
 
   /** Dashboard counters for the logged-in user only. */
   @Get('stats')
-  stats(@Req() request: AuthenticatedRequest) {
-    return this.overviewService.stats(request.user.id)
+  stats(@CurrentUser() user: AuthUserPayload) {
+    return this.overviewService.stats(user.id)
   }
 
   /** The logged-in user's most recent documents (plus the shared knowledge base). */
   @Get('recent-documents')
-  recentDocuments(@Req() request: AuthenticatedRequest) {
-    return this.overviewService.recentDocuments(request.user.id)
+  recentDocuments(@CurrentUser() user: AuthUserPayload) {
+    return this.overviewService.recentDocuments(user.id)
   }
 }

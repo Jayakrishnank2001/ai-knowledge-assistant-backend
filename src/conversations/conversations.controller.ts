@@ -1,12 +1,8 @@
-import { Body, Controller, Delete, Get, Param, Post, Req, UseGuards } from '@nestjs/common'
-import { Request } from 'express'
+import { Body, Controller, Delete, Get, Param, Post, UseGuards } from '@nestjs/common'
 import { AuthGuard } from '../auth/auth.guard'
+import { CurrentUser, AuthUserPayload } from '../common/authenticated-request'
 import { ConversationsService } from './conversations.service'
 import { CreateConversationDto } from './dto/create-conversation.dto'
-
-interface AuthenticatedRequest extends Request {
-  user: { id: string; email: string; name: string }
-}
 
 @UseGuards(AuthGuard)
 @Controller('conversations')
@@ -14,22 +10,22 @@ export class ConversationsController {
   constructor(private readonly conversationsService: ConversationsService) {}
 
   @Get()
-  list(@Req() request: AuthenticatedRequest) {
-    return this.conversationsService.list(request.user.id)
+  list(@CurrentUser() user: AuthUserPayload) {
+    return this.conversationsService.list(user.id)
   }
 
   @Get(':id')
-  get(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
-    return this.conversationsService.getDetail(id, request.user.id)
+  get(@CurrentUser() user: AuthUserPayload, @Param('id') id: string) {
+    return this.conversationsService.getDetail(id, user.id)
   }
 
   @Post()
-  create(@Req() request: AuthenticatedRequest, @Body() dto?: CreateConversationDto) {
-    return this.conversationsService.create(dto, request.user.id)
+  create(@CurrentUser() user: AuthUserPayload, @Body() dto?: CreateConversationDto) {
+    return this.conversationsService.create(dto, user.id)
   }
 
   @Delete(':id')
-  remove(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
-    return this.conversationsService.remove(id, request.user.id)
+  remove(@CurrentUser() user: AuthUserPayload, @Param('id') id: string) {
+    return this.conversationsService.remove(id, user.id)
   }
 }

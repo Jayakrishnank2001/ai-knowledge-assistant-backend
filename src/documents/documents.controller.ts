@@ -1,12 +1,10 @@
 import {
   BadRequestException,
-  Body,
   Controller,
   Delete,
   Get,
   Param,
   Post,
-  Req,
   StreamableFile,
   UploadedFile,
   UseGuards,
@@ -14,13 +12,9 @@ import {
 } from '@nestjs/common'
 import { FileInterceptor } from '@nestjs/platform-express'
 import { memoryStorage } from 'multer'
-import { Request } from 'express'
 import { AuthGuard } from '../auth/auth.guard'
+import { CurrentUser, AuthUserPayload } from '../common/authenticated-request'
 import { DocumentsService } from './documents.service'
-
-interface AuthenticatedRequest extends Request {
-  user: { id: string; email: string; name: string }
-}
 
 @UseGuards(AuthGuard)
 @Controller('documents')
@@ -28,13 +22,13 @@ export class DocumentsController {
   constructor(private readonly documentsService: DocumentsService) {}
 
   @Get()
-  list(@Req() request: AuthenticatedRequest) {
-    return this.documentsService.list(request.user.id)
+  list(@CurrentUser() user: AuthUserPayload) {
+    return this.documentsService.list(user.id)
   }
 
   @Get(':id')
-  get(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
-    return this.documentsService.get(id, request.user.id)
+  get(@CurrentUser() user: AuthUserPayload, @Param('id') id: string) {
+    return this.documentsService.get(id, user.id)
   }
 
   /**
@@ -46,10 +40,10 @@ export class DocumentsController {
    */
   @Get(':id/file')
   async file(
-    @Req() request: AuthenticatedRequest,
+    @CurrentUser() user: AuthUserPayload,
     @Param('id') id: string,
   ): Promise<StreamableFile> {
-    const file = await this.documentsService.openFile(id, request.user.id)
+    const file = await this.documentsService.openFile(id, user.id)
 
     // Quoted fallback for old clients + RFC 5987 form for non-ASCII names.
     const name = encodeURIComponent(file.fileName)
@@ -75,17 +69,17 @@ export class DocumentsController {
     }),
   )
   upload(
-    @Req() request: AuthenticatedRequest,
+    @CurrentUser() user: AuthUserPayload,
     @UploadedFile() file?: Express.Multer.File,
   ) {
     if (!file) {
       throw new BadRequestException('No file uploaded — did you send a "file" field?')
     }
-    return this.documentsService.create(file, request.user.id)
+    return this.documentsService.create(file, user.id)
   }
 
   @Delete(':id')
-  remove(@Req() request: AuthenticatedRequest, @Param('id') id: string) {
-    return this.documentsService.remove(id, request.user.id)
+  remove(@CurrentUser() user: AuthUserPayload, @Param('id') id: string) {
+    return this.documentsService.remove(id, user.id)
   }
 }
