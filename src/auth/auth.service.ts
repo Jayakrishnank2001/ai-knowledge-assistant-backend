@@ -193,7 +193,8 @@ export class AuthService {
    * Rejects taken emails, then stores a pending signup (fresh code, hashed
    * password, 10-minute expiry) and emails the code. Calling it again for
    * the same email just issues a new code, which doubles as "resend".
-   * Returns `devOtp` only when SMTP is unconfigured (local dev fallback).
+   * Returns `devOtp` only when the email service is unconfigured (local dev
+   * fallback).
    */
   async startSignup(dto: SignupStartDto) {
     const email = dto.email.toLowerCase()

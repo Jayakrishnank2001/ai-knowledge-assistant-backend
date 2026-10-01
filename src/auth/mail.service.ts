@@ -1,5 +1,4 @@
 import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common'
-import { createTransport, Transporter } from 'nodemailer'
 
 export interface SignupMail {
   to: string
@@ -9,47 +8,20 @@ export interface SignupMail {
 const OTP_TTL_MINUTES = 10
 
 /**
- * Sends the 6-digit signup OTP over SMTP.
+ * Sends the 6-digit signup OTP through the Resend HTTP API.
  *
- * SMTP is configured with SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS
- * (plus optional SMTP_FROM) in the backend .env.
+ * Configured with RESEND_API_KEY (plus MAIL_FROM for the sender address) in
+ * the backend .env.
  *
- * Until SMTP is configured the service falls back to a development mode:
+ * Until Resend is configured the service falls back to a development mode:
  * the code is logged to the backend console and handed back to the caller
- * so the flow stays testable locally. In production, a missing SMTP config
- * is a hard error - an OTP signup that cannot send email must not silently
+ * so the flow stays testable locally. In production, a missing API key is a
+ * hard error - an OTP signup that cannot send email must not silently
  * "succeed".
  */
 @Injectable()
 export class MailService {
   private readonly logger = new Logger(MailService.name)
-  private readonly transporter: Transporter | null
-
-  constructor() {
-    const { host, port, user, pass } = {
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT ?? 587),
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    }
-
-    this.transporter =
-      host && user && pass
-        ? createTransport({ host, port, secure: port === 465, auth: { user, pass } })
-        : null
-
-    if (!this.transporter) {
-      this.logger.warn(
-        'SMTP is not configured (SMTP_HOST/SMTP_USER/SMTP_PASS) - signup codes will be ' +
-          'printed to this console instead of being emailed.',
-      )
-    }
-  }
-
-  /** True when real emails will be sent (i.e. SMTP credentials exist). */
-  get isSmtpConfigured(): boolean {
-    return this.transporter !== null
-  }
 
   /**
    * Email the code to the user.
@@ -58,7 +30,9 @@ export class MailService {
    * caller may surface it as a hint. Real sends resolve with null.
    */
   async sendSignupOtp(mail: SignupMail): Promise<string | null> {
-    if (!this.transporter) {
+    const apiKey = process.env.RESEND_API_KEY
+
+    if (!apiKey) {
       if (process.env.NODE_ENV === 'production') {
         throw new ServiceUnavailableException(
           'Email service is not configured - signup is unavailable on this server.',
@@ -68,30 +42,43 @@ export class MailService {
       return mail.code
     }
 
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 8_000) // fail fast instead of hanging
+
     try {
-      await this.transporter.sendMail({
-        from: process.env.SMTP_FROM ?? process.env.SMTP_USER,
-        to: mail.to,
-        subject: 'Your Nexa AI signup code',
-        text: `Your verification code is ${mail.code}. It expires in ${OTP_TTL_MINUTES} minutes.`,
-        html: [
-          '<div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">',
-          '<h2 style="color: #201b29;">Verify your email</h2>',
-          `<p>Enter this code to finish creating your Nexa AI account:</p>`,
-          `<p style="font-size: 32px; letter-spacing: 8px; font-weight: bold; color: #9b6aff;">${mail.code}</p>`,
-          `<p style="color: #666;">The code expires in ${OTP_TTL_MINUTES} minutes. ` +
-            'If you did not request it, you can ignore this email.</p>',
-          '</div>',
-        ].join(''),
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: process.env.MAIL_FROM, // e.g. 'Nexa AI <noreply@yourdomain.com>'
+          to: [mail.to],
+          subject: 'Your Nexa AI signup code',
+          text: `Your verification code is ${mail.code}. It expires in ${OTP_TTL_MINUTES} minutes.`,
+          html: [
+            '<div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">',
+            '<h2 style="color: #201b29;">Verify your email</h2>',
+            '<p>Enter this code to finish creating your Nexa AI account:</p>',
+            `<p style="font-size: 32px; letter-spacing: 8px; font-weight: bold; color: #9b6aff;">${mail.code}</p>`,
+            `<p style="color: #666;">The code expires in ${OTP_TTL_MINUTES} minutes. If you did not request it, you can ignore this email.</p>`,
+            '</div>',
+          ].join(''),
+        }),
+        signal: controller.signal,
       })
+
+      if (!res.ok) {
+        throw new Error(`Resend responded ${res.status}: ${await res.text()}`)
+      }
     } catch (error) {
-      // SMTP rejected the send (bad credentials, network down, provider outage).
-      // Log the full cause server-side but never leak it to the client - a raw
-      // nodemailer error would expose host/credential details in the response.
       this.logger.error(`Failed to send signup OTP to ${mail.to}: ${(error as Error).message}`)
       throw new ServiceUnavailableException(
         'Could not send the verification email - please try again in a moment',
       )
+    } finally {
+      clearTimeout(timer)
     }
     return null
   }

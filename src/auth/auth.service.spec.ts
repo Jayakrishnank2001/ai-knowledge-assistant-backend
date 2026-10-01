@@ -85,7 +85,7 @@ describe('AuthService - OTP signup', () => {
       expect(db.signupOtps.updateOne).not.toHaveBeenCalled()
     })
 
-    it('omits devOtp when the mailer does not echo the code (real SMTP)', async () => {
+    it('omits devOtp when the mailer does not echo the code (real email)', async () => {
       db.users.exists.mockResolvedValue(false)
       mailer.sendSignupOtp.mockResolvedValue(null)
 

@@ -6,7 +6,7 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 > **Status:** working RAG pipeline backed by **MongoDB Atlas** (+ Atlas Vector
 > Search), **Gemini embeddings** (`gemini-embedding-001`) and a **Gemini chat
 > model** — with an offline mock fallback when no `GEMINI_API_KEY` is set.
-> Signup uses **email + password with a 6-digit OTP** delivered over SMTP.
+> Signup uses **email + password with a 6-digit OTP** delivered through Resend.
 >
 > The UI lives in [`../ai-knowledge-assistant-frontend`](../ai-knowledge-assistant-frontend)
 > (see its README for setup).
@@ -25,7 +25,7 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 | Chat answers       | Gemini chat model (see GEMINI_CHAT_MODEL) |
 | Vector search      | Atlas Vector Search ($vectorSearch) + in-process cosine fallback |
 | Auth               | Email+password (bcrypt) + 6-digit email OTP, JWT sessions |
-| Email              | nodemailer over SMTP (dev fallback: code logged to console) |
+| Email              | Resend HTTP API (dev fallback: code logged to console) |
 | Validation         | class-validator + ValidationPipe    |
 
 ## Getting started
@@ -33,7 +33,7 @@ A basic [NestJS](https://nestjs.com/) REST API that powers the
 ```bash
 npm install
 
-# 1. Configure .env (MongoDB + Gemini are required; SMTP is optional but
+# 1. Configure .env (MongoDB + Gemini are required; Resend is optional but
 #    recommended so signup codes are emailed instead of printed to the console)
 cp .env.example .env
 
@@ -100,7 +100,7 @@ Set a different port with the `PORT` environment variable (see `.env.example`).
 | `RAG_RELEVANCE_MARGIN` | Drop chunks scoring more than this below the best match (default `0.04`) | `0.04` |
 | `JWT_EXPIRES_IN`  | Access-token lifetime                                      | `7d`   |
 | `CORS_ORIGINS`    | Comma-separated browser origins allowed by CORS (omit → any origin) | `http://localhost:3000,https://ai-knowledge-assistant-liart-theta.vercel.app` |
-| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | SMTP account for signup OTP emails (omit → dev fallback) | `smtp.gmail.com` |
+| `RESEND_API_KEY` / `MAIL_FROM` | Resend API key + sender address for signup OTP emails (omit → dev fallback) | `re_xxxxxxxx` |
 
 > ⚠️ The real connection string lives in `.env` (gitignored). `.env.example` only
 > contains placeholders — never commit real credentials.
@@ -189,7 +189,7 @@ Every route except `/` and `/api/health` requires a **Bearer JWT**.
   base plus the asker's own documents.
 
 ```bash
-# Demo isolation check (after login):
+# Access check (after login):
 curl.exe -H "Authorization: Bearer $TOKEN" \
   http://localhost:3001/api/conversations        # only YOUR conversations
 ```
@@ -201,7 +201,7 @@ src/
 ├── main.ts                     # bootstrap: MongoDB connect, CORS, /api prefix, validation
 ├── app.module.ts               # root module wiring all feature modules
 ├── common/                     # shared @CurrentUser decorator + request types
-├── database/                   # @Global Mongoose-backed data layer + seeding
+├── database/                   # @Global Mongoose-backed data layer
 │   ├── models.ts               # schemas + typed models (users, documents, document_chunks,
 │   │                           #   conversations, messages, pending_signups, revoked_tokens)
 │   └── database.service.ts     # repository facade (db.users / .documents / ...)
@@ -232,7 +232,7 @@ Module      -> wraps controller + providers for that feature
 
 Base URL: `http://localhost:3001/api`
 
-### Auth (demo account: `demo@nexa.ai` / `password123`)
+### Auth
 
 | Method | Route                | Body                                | Description                                      |
 | ------ | -------------------- | ----------------------------------- | ------------------------------------------------ |
@@ -245,7 +245,7 @@ Base URL: `http://localhost:3001/api`
 | POST   | `/auth/logout`       | _Bearer token_                      | Revokes the token (server-side deny-list)        |
 
 **Sessions:** signed **JWTs** (7-day expiry, `JWT_SECRET` in `.env`). Passwords are
-hashed with **bcrypt** on register/seed; legacy plaintext rows are upgraded to a
+hashed with **bcrypt** on register; legacy plaintext rows are upgraded to a
 hash on first login. Because tokens are stateless, they **survive server
 restarts**. Logout writes the token to a `revoked_tokens` collection with a TTL
 index, so it stops working immediately and the row self-deletes once the JWT
@@ -331,7 +331,7 @@ land on `status: "failed"` with a logged reason).
 curl.exe -X POST http://localhost:3001/api/auth/signup/start \
   -H "Content-Type: application/json" \
   -d '{"email":"you@example.com","password":"s3cret-pass"}'
-# → 6-digit code emailed (printed to the backend console if SMTP is unconfigured)
+# → 6-digit code emailed (printed to the backend console if Resend is unconfigured)
 
 curl.exe -X POST http://localhost:3001/api/auth/signup/verify \
   -H "Content-Type: application/json" \
